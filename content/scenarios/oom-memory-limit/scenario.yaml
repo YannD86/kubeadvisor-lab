@@ -1,0 +1,48 @@
+id: oom-memory-limit
+title: "Worker killed with exit code 137"
+realm: scenarios
+category: config
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [resources, limits, OOMKilled, exit-137, CrashLoopBackOff]
+requires_addons: []
+summary: "The report-worker in lab-oom dies seconds after start with exit code 137 and never finishes a batch. The data team insists the job is unchanged. Find who is killing it and size it properly."
+brief: |
+  **Ticket #5160 — P2 — nightly report worker never completes**
+
+  The `report-worker` Deployment in namespace `lab-oom` processes a batch of
+  report data at start-up and then idles until the next schedule. Since it
+  was moved to the shared cluster it dies a few seconds after start, every
+  time, and ends up in `CrashLoopBackOff`. `kubectl logs` shows nothing
+  useful: the log simply stops.
+
+  The data team says the batch command has not changed in months and that
+  "it worked fine on the old VM". They need it running today.
+
+  ## Your task
+  - `report-worker` Pod `Running`, `1/1 Ready`, and no longer restarting in namespace `lab-oom`.
+  - The batch command must stay exactly as the data team wrote it.
+  - Keep a memory limit on the container (platform policy requires one), sized so the worker can actually finish its batch.
+namespace: lab-oom
+hints:
+  - "kubectl describe pod -n lab-oom <pod>: read `Last State`, its `Reason` and `Exit Code`. 137 = 128 + 9: the process received SIGKILL. Who sends SIGKILL without a word in the logs?"
+  - "Reason `OOMKilled` means the container exceeded its cgroup memory limit and the kernel killed it. Compare `Limits.memory` in the Pod with what the batch command loads into memory (`head -c 300m ... | tail` buffers the whole input)."
+  - "The worker genuinely needs a few hundred MiB for its batch. Raise `resources.limits.memory` on the Deployment (kubectl edit deploy report-worker -n lab-oom) to at least 512Mi, keeping the request small."
+  - "To watch real usage you would run `kubectl top pod -n lab-oom` (needs the metrics-server addon); without it, `Last State` + exit code is your evidence."
+checks:
+  - name: "Memory limit is at least 400Mi"
+    cmd: kubectl get deploy -n lab-oom report-worker -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' | awk '{ v=$0; n=v+0; if (v ~ /Gi$/) n*=1024; else if (v ~ /Mi$/) n=n; else if (v ~ /Ki$/) n/=1024; else if (v ~ /G$/) n*=1000*1000*1000/1048576; else if (v ~ /M$/) n*=1000*1000/1048576; else if (v ~ /[kK]$/) n*=1000/1048576; else n/=1048576; exit !(n>=400) }'
+  - name: "The batch command is unchanged"
+    cmd: kubectl get deploy -n lab-oom report-worker -o jsonpath='{.spec.template.spec.containers[0].args}' | grep -q 'head -c 300m /dev/zero | tail'
+  - name: "Pod is Running and Ready"
+    cmd: kubectl rollout status -n lab-oom deploy/report-worker --timeout=15s >/dev/null && test "$(kubectl get deploy -n lab-oom report-worker -o jsonpath='{.status.readyReplicas}')" = "1"
+  - name: "The current Pod was never OOMKilled"
+    cmd: for i in 1 2 3 4 5; do test "$(kubectl get pods -n lab-oom -l app=report-worker -o jsonpath='{.items[*].status.containerStatuses[0].lastState.terminated.reason}' | grep -c OOMKilled)" = "0" && exit 0; sleep 2; done; exit 1
+  - name: "Restart count stays flat (observed over 15s)"
+    cmd: a=$(kubectl get pods -n lab-oom -l app=report-worker -o jsonpath='{range .items[*]}{.metadata.name}={.status.containerStatuses[0].restartCount} {end}'); sleep 15; b=$(kubectl get pods -n lab-oom -l app=report-worker -o jsonpath='{range .items[*]}{.metadata.name}={.status.containerStatuses[0].restartCount} {end}'); test -n "$a" && test "$a" = "$b"
+concepts:
+  - "Exit code 137 = 128 + SIGKILL. With `Reason: OOMKilled` in Last State, the kernel's OOM killer enforced the container's cgroup memory limit; the application never gets a chance to log anything."
+  - "requests decide scheduling, limits decide killing. A request can stay small for a bursty job, but the limit must cover the real peak, or the Pod will loop through OOMKilled -> CrashLoopBackOff forever."
+  - "`kubectl top pod` (metrics-server) and container_memory_working_set_bytes (cAdvisor/Prometheus) show actual usage; size limits from measurements, not guesses."
+related_lessons: [troubleshooting/config-triage]

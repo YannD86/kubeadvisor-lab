@@ -1,0 +1,50 @@
+id: kubelet-stopped
+title: "Worker node NotReady, app at half capacity"
+realm: scenarios
+category: node
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [node, kubelet, notready, systemd]
+requires_addons: []
+summary: "A worker flips to NotReady while its containers keep running underneath. Get onto the node, find the agent that went quiet, and bring it back."
+brief: |
+  **Ticket #5058 — P1 — sre-labs-worker NotReady, api running at half capacity**
+
+  Monitoring fired `KubeNodeNotReady` for `sre-labs-worker` at 03:12. The
+  `api` Deployment in `lab-kubelet` runs one replica per worker (pod
+  anti-affinity), so one of its two Pods lives on the affected node; its status
+  in `kubectl` is stale and may turn `Terminating` or `Unknown` after a few
+  minutes.
+
+  The infra on-call checked the host: the VM is up, has network, `containerd`
+  is running, and the application containers are still alive from the host's
+  point of view. Nothing in the cluster was changed since last week.
+
+  **Lab note:** in this lab, nodes are Docker containers. Where you would
+  normally `ssh` to the node, run `docker exec -it sre-labs-worker bash`.
+
+  ## Your task
+  - `sre-labs-worker` must report `Ready` and stay schedulable.
+  - The kubelet service on that node must be active (`systemctl is-active kubelet`).
+  - `api` must be back to 2/2 Ready.
+namespace: lab-kubelet
+hints:
+  - "kubectl describe node sre-labs-worker   Under Conditions, a Ready condition with status Unknown and message 'Kubelet stopped posting node status' means the API server has not heard from this node's kubelet for 50 s (node-monitor-grace-period). The host being up says nothing about the agent."
+  - "The kubelet is the node's agent and a plain systemd service. Get on the node (docker exec -it sre-labs-worker bash; on a real node: ssh) and run: systemctl status kubelet ; journalctl -u kubelet -n 50 --no-pager"
+  - "If systemctl reports inactive (dead), nothing is crashing: it was stopped. systemctl start kubelet brings it back (and systemctl enable kubelet makes sure it survives a reboot)."
+  - "Once the kubelet posts status again the node turns Ready within ~10 s. If the Pod on that node was marked Terminating by the eviction logic, the kubelet finishes it and the ReplicaSet creates a fresh one: kubectl rollout status deploy/api -n lab-kubelet"
+checks:
+  - name: "sre-labs-worker reports Ready"
+    cmd: kubectl get node sre-labs-worker -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -qx True
+  - name: "kubelet service is active on sre-labs-worker"
+    cmd: docker exec sre-labs-worker systemctl is-active kubelet | grep -qx active
+  - name: "sre-labs-worker is schedulable (not cordoned or drained)"
+    cmd: test "$(kubectl get node sre-labs-worker -o jsonpath='{.spec.unschedulable}')" != "true"
+  - name: "api Deployment is 2/2 Ready"
+    cmd: test "$(kubectl get deploy -n lab-kubelet api -o jsonpath='{.status.readyReplicas}')" = "2"
+concepts:
+  - "The kubelet is the only component that speaks for a node. When it stops posting status, the node-lifecycle controller marks Ready=Unknown after node-monitor-grace-period (50 s by default since 1.32), taints the node `node.kubernetes.io/unreachable:NoExecute`, and after 5 minutes (default toleration) Pods on it are evicted."
+  - "Containers do not die when the kubelet dies: containerd keeps them running. That is why the app may still answer on its Pod IP while the cluster thinks the node is gone, and why NotReady is a control-plane view, not a host fact."
+  - "On any kubeadm cluster the kubelet is a systemd unit: `systemctl status kubelet` and `journalctl -u kubelet` are the first two commands after ssh. Typical real-world causes: host OOM, disk full, expired kubelet certificate, bad config after an upgrade (see components/kubelet-and-container-runtime)."
+related_lessons: [troubleshooting/node-triage]

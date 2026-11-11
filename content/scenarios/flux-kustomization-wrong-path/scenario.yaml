@@ -1,0 +1,52 @@
+id: flux-kustomization-wrong-path
+title: "Kustomization path not found"
+realm: scenarios
+category: gitops
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [flux, kustomization, path, artifact, gitops]
+requires_addons: [gitea, flux]
+summary: "The Git source is healthy, the Kustomization is not, and production podinfo was never deployed. Find what the kustomize-controller is looking for and where it should have looked."
+brief: |
+  **Ticket #5107 — P2 — production podinfo never deployed after the GitOps migration**
+
+  The podinfo team moved their production manifests from a CI `kubectl apply`
+  job to Flux yesterday. The repository `flux-kustomization-wrong-path` is on
+  the local Git server, the Flux objects live in namespace `lab-path`, and
+  `flux get sources git -n lab-path` is green (`stored artifact for revision
+  'main@sha1:...'`). Yet there is no `podinfo` Deployment anywhere, and
+  `flux get kustomizations -n lab-path` prints:
+
+      NAME     REVISION   SUSPENDED   READY   MESSAGE
+      podinfo             False       False   kustomization path not found: stat /tmp/kustomization-2381170524/deploy/prod: no such file or directory
+
+  The team insists: "the directory is in Git, we pushed it, look at the repo".
+  They did not touch the GitRepository and ask us not to either: other teams
+  are about to reuse it.
+
+  ## Your task
+  - Make Kustomization `podinfo` in `lab-path` reconcile (`Ready=True`).
+  - Fix the Kustomization so that it points at what is really in the repository; leave the GitRepository untouched.
+  - Deployment `podinfo` in `lab-prod` is available with 2/2 replicas.
+namespace: lab-path
+hints:
+  - "Separate the two halves of the pipeline: the source is Ready (artifact stored), so the problem is in what kustomize-controller does with the artifact. kubectl describe kustomization podinfo -n lab-path shows the full message."
+  - "Compare spec.path with the real tree: git clone http://lab:labpass123@localhost:30080/lab/flux-kustomization-wrong-path.git && find flux-kustomization-wrong-path -name kustomization.yaml   (or browse http://localhost:30080/lab/flux-kustomization-wrong-path)"
+  - "kubectl get kustomization podinfo -n lab-path -o jsonpath='{.spec.path}'   — one directory name is abbreviated compared to Git."
+  - "Edit only the Kustomization: kubectl edit kustomization podinfo -n lab-path and fix spec.path. A spec change triggers an immediate reconcile; flux reconcile kustomization podinfo -n lab-path forces one."
+checks:
+  - name: "Kustomization podinfo in lab-path is Ready"
+    cmd: test "$(kubectl get kustomization -n lab-path podinfo -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True"
+  - name: "spec.path points at the directory that exists in Git (deploy/production)"
+    cmd: kubectl get kustomization -n lab-path podinfo -o jsonpath='{.spec.path}' | grep -qxE '(\./)?deploy/production/?'
+  - name: "GitRepository podinfo was not modified"
+    cmd: test "$(kubectl get gitrepository -n lab-path podinfo -o jsonpath='{.metadata.generation}')" = "1"
+  - name: "Deployment podinfo in lab-prod is available (2/2)"
+    cmd: test "$(kubectl get deploy -n lab-prod podinfo -o jsonpath='{.status.availableReplicas}')" = "2"
+concepts:
+  - "A Kustomization never reads Git. It downloads the source's artifact (a tarball), extracts it to a temp dir and runs kustomize build on `spec.path` inside it: 'path not found' is evaluated against the artifact, which is why the message shows /tmp/kustomization-.../. Builder: flux-kustomization."
+  - "Flux reports the failure in the object itself: `status.conditions[Ready]` with reason `ArtifactFailed` and the exact error. `flux get`, `kubectl describe` and the controller logs all show the same text; start with the object."
+  - "`spec.path` is relative to the repository root; `./deploy/production`, `deploy/production` and `./deploy/production/` are all accepted. The kustomization.yaml inside that directory decides what gets applied."
+  - "Every Flux object exposes `metadata.generation` vs `status.observedGeneration`: when they match and Ready is False, the controller has evaluated your latest spec and still disagrees."
+related_lessons: [gitops/flux-architecture]

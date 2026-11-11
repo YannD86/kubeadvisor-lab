@@ -1,0 +1,29 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  content:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install pyyaml
+      - run: python scripts/validate_content.py
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install -r api/requirements.txt
+      - run: cd api && python -m pytest -q tests
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm, cache-dependency-path: web/package-lock.json }
+      - run: cd web && npm ci --no-audit --no-fund
+      - run: cd web && npx tsc --noEmit -p .
+      - run: cd web && npx eslint src
+      - run: cd web && npm run build

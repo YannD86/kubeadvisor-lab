@@ -1,0 +1,52 @@
+id: svc-wrong-targetport
+title: "Service has endpoints but refuses connections"
+realm: scenarios
+category: network
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [service, endpoints, targetport, ports]
+requires_addons: []
+summary: "The catalog Service lists healthy endpoints, yet every request gets connection refused. Follow the port, not the Pods."
+brief: |
+  **Ticket #4873 — P2 — catalog Service refuses connections**
+
+  The checkout team calls `http://web.lab-shop2.svc` and gets
+  `curl: (7) Failed to connect to web port 80: Connection refused`.
+  After last week's incident they did their homework before paging us:
+
+  - `kubectl get endpointslices -n lab-shop2` lists two addresses for `web`, so
+    the selector is fine this time.
+  - All `web` Pods are `Running` and `1/1 Ready`; `kubectl logs` shows nginx
+    started normally.
+  - `kubectl port-forward pod/<a-web-pod> 8080:80` followed by
+    `curl localhost:8080` returns the catalog page.
+
+  They are out of ideas and the catalog page is blank for customers.
+
+  ## Your task
+  - Make `http://web` in namespace `lab-shop2` return HTTP 200 from inside the cluster.
+  - Fix the Service only. The Deployment is owned by the catalog team and must
+    not be modified (no new rollout).
+namespace: lab-shop2
+hints:
+  - "An EndpointSlice carries two pieces of information: the backend addresses *and the port*. Read both columns: kubectl get endpointslices -n lab-shop2 -l kubernetes.io/service-name=web"
+  - "Connection refused while endpoints exist means the packet reached a Pod but nothing was listening on that port. Which port does nginx listen on? kubectl exec -n lab-shop2 deploy/web -- netstat -tln (or read containerPort in the Pod spec)."
+  - "Compare spec.ports[].targetPort on the Service with the containerPort of the Pod: kubectl get svc web -n lab-shop2 -o yaml | grep -B2 -A4 targetPort"
+  - >-
+    One-line fix on the Service:
+    kubectl patch svc web -n lab-shop2 --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":80}]'
+checks:
+  - name: "Service web now targets the port nginx listens on (EndpointSlice shows port 80)"
+    cmd: test "$(kubectl get endpointslices -n lab-shop2 -l kubernetes.io/service-name=web -o jsonpath='{.items[0].ports[0].port}')" = "80"
+  - name: "Deployment was not modified (generation still 1)"
+    cmd: test "$(kubectl get deploy -n lab-shop2 web -o jsonpath='{.metadata.generation}')" = "1"
+  - name: "Both web Pods are still Ready"
+    cmd: test "$(kubectl get deploy -n lab-shop2 web -o jsonpath='{.status.readyReplicas}')" = "2"
+  - name: "HTTP 200 from a Pod inside the cluster"
+    cmd: kubectl run -n lab-shop2 probe-$RANDOM --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- -s -o /dev/null -w '%{http_code}' --max-time 5 http://web | grep -q 200
+concepts:
+  - "A Service has two ports: `port` is what clients dial on the ClusterIP, `targetPort` is what kube-proxy DNATs to on the Pod. The Endpoints object shows the resolved `IP:targetPort` pairs, so an endpoint list is only healthy if the port is right too."
+  - "Connection refused versus timeout: refused means something answered with a TCP reset (no listener on that port, or no endpoints at all); a timeout means packets are being dropped (NetworkPolicy, firewall, wrong IP)."
+  - "Named ports (`containerPort: 80, name: http` and `targetPort: http`) make the contract explicit and survive image changes; a bare number silently drifts."
+related_lessons: [troubleshooting/network-triage]

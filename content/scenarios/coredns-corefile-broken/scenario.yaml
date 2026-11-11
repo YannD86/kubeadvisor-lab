@@ -1,0 +1,50 @@
+id: coredns-corefile-broken
+title: "Cluster names stopped resolving"
+realm: scenarios
+category: network
+type: troubleshoot
+difficulty: advanced
+estimated_minutes: 20
+tags: [coredns, dns, corefile, kube-system]
+requires_addons: []
+summary: "Every Pod in the cluster suddenly fails to resolve Service names while external names still work. Find the one line in kube-system that broke it."
+brief: |
+  **Ticket #5002 — P1 — "everything is down": Service names no longer resolve**
+
+  Several teams report at the same time that their applications cannot reach
+  each other. The demo app in `lab-dns` is typical: the `frontend` Pod logs
+  `curl: (6) Could not resolve host: backend` on every request, while the
+  `backend` Pods are Running, Ready and reachable by **IP**. Public names such
+  as `kubernetes.io` still resolve from inside Pods.
+
+  Nodes are Ready, `kube-system` shows nothing Pending or crashing, and the
+  network team swears nothing changed on their side. Someone mentions that the
+  platform team "tuned the cluster DNS" earlier today, but they are not
+  reachable.
+
+  ## Your task
+  - Pods must resolve cluster names again: `nslookup kubernetes.default.svc.cluster.local`
+    from a `busybox` Pod must succeed.
+  - The CoreDNS Deployment in `kube-system` must be fully rolled out and Ready.
+  - `frontend` must get HTTP 200 from `http://backend` in `lab-dns`.
+namespace: lab-dns
+hints:
+  - "Name resolution inside Pods goes to the kube-dns Service, which fronts the CoreDNS Pods in kube-system. Check them first: kubectl -n kube-system get pods -l k8s-app=kube-dns ; kubectl -n kube-system logs -l k8s-app=kube-dns --tail=20"
+  - "Narrow the failure from a busybox Pod: kubectl run -n lab-dns dbg --rm -it --restart=Never --image=busybox:1.36 -- sh, then nslookup kubernetes.default.svc.cluster.local (fails: NXDOMAIN) versus nslookup kubernetes.io (works). Forwarding is fine; the cluster zone is not being served."
+  - "CoreDNS is configured by the coredns ConfigMap in kube-system (the Corefile): kubectl -n kube-system get cm coredns -o yaml. Read the kubernetes plugin line: the first argument is the zone CoreDNS is authoritative for. Does it match the cluster domain in a Pod's /etc/resolv.conf search list?"
+  - "Restore cluster.local on the kubernetes plugin line (kubectl -n kube-system edit cm coredns), then kubectl -n kube-system rollout restart deploy/coredns. The reload plugin would also pick it up within about 30-45 s, but a restart is deterministic."
+checks:
+  - name: "Corefile serves the cluster.local zone again"
+    cmd: kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' | grep -q 'kubernetes cluster.local'
+  - name: "CoreDNS Deployment is fully rolled out and Ready"
+    cmd: kubectl -n kube-system rollout status deploy/coredns --timeout=15s >/dev/null && test "$(kubectl -n kube-system get deploy coredns -o jsonpath='{.status.readyReplicas}')" -ge 1
+  - name: "kubernetes.default.svc.cluster.local resolves from a busybox Pod"
+    cmd: kubectl run -n lab-dns dnsprobe-$RANDOM --rm -i --restart=Never --image=busybox:1.36 --quiet -- nslookup kubernetes.default.svc.cluster.local 2>&1 | grep -q '^Name:.*kubernetes.default.svc.cluster.local'
+  - name: "frontend reaches backend by name (HTTP 200)"
+    cmd: kubectl exec -n lab-dns deploy/frontend -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://backend | grep -q 200
+concepts:
+  - "CoreDNS answers Service/Pod records only for the zone(s) named on the `kubernetes` plugin line; a query outside those zones falls through to `forward . /etc/resolv.conf` and comes back NXDOMAIN from the upstream resolver."
+  - "A Pod's /etc/resolv.conf points at the kube-dns ClusterIP with the search list `<ns>.svc.cluster.local svc.cluster.local cluster.local`; short names like `backend` only work because that cluster domain and the Corefile zone agree."
+  - "Shape of the failure tells you the layer: resolution broken for every Pod at once is CoreDNS (Corefile, Pods or the kube-dns Service); broken for one workload is that Pod's dnsPolicy/dnsConfig."
+  - "CoreDNS reloads its Corefile on change (`reload` plugin) but `kubectl rollout restart` is the deterministic way to apply it and to verify the Pods come back Ready. See components/cni-and-coredns."
+related_lessons: [troubleshooting/network-triage]

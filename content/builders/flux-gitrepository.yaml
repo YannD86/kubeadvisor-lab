@@ -1,0 +1,220 @@
+id: flux-gitrepository
+title: "Flux GitRepository: declare a Git source"
+kind: GitRepository
+apiVersion: source.toolkit.fluxcd.io/v1
+realm: manifests
+track: flux
+difficulty: beginner
+estimated_minutes: 12
+summary: >
+  Build the GitRepository that points Flux at the lab's in-cluster Gitea
+  repo, and learn what source-controller actually produces from it: a
+  versioned tarball artifact that every other Flux controller consumes.
+intro: |
+  Flux never applies a Git repository directly. `source-controller` clones
+  the repo on an interval, checks out the ref you asked for, packages the
+  checkout into a `.tar.gz` **artifact**, stores it on its own volume and
+  advertises it in `status.artifact` with a URL
+  (`http://source-controller.flux-system.svc.cluster.local./gitrepository/<ns>/<name>/<checksum>.tar.gz`)
+  and a **revision** of the form `main@sha1:<commit>`.
+
+  `kustomize-controller` and `helm-controller` only ever download that
+  artifact. This split is why a Flux `Kustomization` can be in a different
+  namespace, why credentials live next to the source and not next to the
+  app, and why "Flux is not deploying" is often a *source* problem: no new
+  artifact, no new apply.
+
+  In this lab the repository lives in Gitea inside the cluster, reachable
+  at `http://gitea.lab-gitea.svc.cluster.local:3000`. Repos are public, so
+  no credentials are needed; the `why` of the URL step covers what changes
+  when they are.
+prerequisites: []
+crd: true
+docs_url: https://fluxcd.io/flux/components/source/gitrepositories/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare which API this object speaks."
+    why: |
+      All Flux sources (GitRepository, HelmRepository, OCIRepository, Bucket)
+      live in the `source.toolkit.fluxcd.io` group, served by
+      `source-controller`. `v1` is the only version still served: the beta
+      versions were removed from the CRDs in Flux 2.7 (`v1beta1`) and 2.8
+      (`v1beta2`), so a beta manifest fails discovery and must be migrated
+      (`flux migrate`). `v1` is also the version that changed the revision
+      format to `<branch>@sha1:<commit>`.
+    hint: "Flux sources live under source.toolkit.fluxcd.io; the stable version is v1."
+    expect: { type: equals, value: source.toolkit.fluxcd.io/v1 }
+    reveal: "apiVersion: source.toolkit.fluxcd.io/v1"
+    gotchas:
+      - "`source.toolkit.fluxcd.io/v1beta1` was removed in Flux 2.x; old blog posts still show it and the API server rejects it."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `GitRepository` is one of four source kinds. Pick it when the
+      deployable truth is a Git tree. If you push manifests or charts as
+      OCI artifacts (`flux push artifact`), you would use `OCIRepository`
+      instead; the downstream Kustomization only changes `sourceRef.kind`.
+    hint: "CamelCase, singular: the Git flavour of a Flux source."
+    expect: { type: equals, value: GitRepository }
+    reveal: "kind: GitRepository"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the source after the repository it tracks."
+    why: |
+      Every Kustomization and HelmChart that consumes this repo references
+      the pair `sourceRef.kind` + `sourceRef.name`. Renaming a source later
+      means touching every consumer and re-downloading artifacts, so name it
+      after the repo, not after the first app you deploy from it.
+    hint: "Lowercase DNS label; consumers will write this in spec.sourceRef.name."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: podinfo
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place the source in the Flux namespace."
+    why: |
+      Sources are namespaced. The convention is to keep them in
+      `flux-system`, next to the controllers, and let consumers reference
+      them cross-namespace with `sourceRef.namespace`. Credentials
+      (`spec.secretRef`) must live in the *same* namespace as the source,
+      which is another reason to centralise sources: one Secret per repo,
+      not one per application namespace.
+    hint: "The namespace Flux was installed in."
+    expect: { type: equals, value: flux-system }
+    reveal: "  namespace: flux-system"
+    gotchas:
+      - "If you put a GitRepository in lab-podinfo, a Kustomization in flux-system cannot find it unless its sourceRef.namespace says lab-podinfo."
+  - path: spec.interval
+    title: "Interval"
+    prompt: "Tell source-controller how often to check the repo for new commits."
+    why: |
+      `interval` is **required**: the CRD rejects a GitRepository without
+      it. It is the polling period for `git fetch`. A new artifact is only
+      produced when the resolved commit changes, so a short interval costs
+      Git server load, not cluster load. Webhooks (`Receiver` objects) can
+      shorten the loop by triggering an immediate reconcile, but the
+      interval remains the safety net when a webhook is lost.
+    hint: "A Go duration such as 1m or 5m. Required."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: |
+      spec:
+        interval: 1m
+    gotchas:
+      - "Durations are Go-style: 1m, 30s, 2h. There is no d unit; write 24h."
+      - "flux reconcile source git podinfo forces a fetch now by stamping the reconcile.fluxcd.io/requestedAt annotation."
+  - path: spec.url
+    title: "Repository URL"
+    prompt: "Point at the lab's Gitea repository, as reached from inside the cluster."
+    why: |
+      The clone happens from the `source-controller` Pod, so the URL must
+      resolve from the cluster network, not from your laptop: in this lab
+      that is the Service DNS name of Gitea, not `localhost:30080`. The
+      scheme chooses the auth mechanism. `http(s)://` repos use basic auth
+      or a bearer token from `spec.secretRef` (keys `username`/`password` or
+      `bearerToken`); `ssh://` repos need `identity`, `identity.pub` and
+      `known_hosts` in that Secret. Public repos, like every lab repo, need
+      no `secretRef` at all.
+    hint: "Cluster-internal Gitea URL; the repo lives under the lab user."
+    expect: { type: regex, value: "^(https?|ssh)://.+" }
+    reveal: "  url: http://gitea.lab-gitea.svc.cluster.local:3000/lab/podinfo.git"
+    gotchas:
+      - "A URL that works on your machine but not in the Pod shows up as 'failed to checkout and determine revision' with a DNS or connection-refused error."
+      - "secretRef points to a Secret in the GitRepository namespace; a Secret in the app namespace is never consulted."
+  - path: spec.ref.branch
+    title: "Which ref to follow"
+    prompt: "Track the main branch."
+    why: |
+      `ref` decides what gets checked out. `branch` follows the branch head;
+      `tag` pins a tag; `semver` picks the highest tag matching a range;
+      `commit` pins a SHA; `name` takes a full ref like
+      `refs/pull/42/head`. If several are set, precedence is `commit` >
+      `name` > `semver` > `tag` > `branch`. Without any `ref`, Flux falls
+      back to `master`, which is the single most common reason a fresh
+      GitRepository reports `couldn't find remote ref "refs/heads/master"`.
+    hint: "ref is a map; the lab's Gitea repos default to main."
+    expect: { type: regex, value: "^[A-Za-z0-9._/-]+$" }
+    reveal: |
+      ref:
+        branch: main
+    gotchas:
+      - "Omitting ref does not mean 'default branch': it means master."
+  - path: spec.ignore
+    title: "Ignore patterns"
+    prompt: "Exclude everything except the deploy directory and its non-manifest files."
+    why: |
+      `ignore` uses `.gitignore` syntax and is applied when the artifact is
+      built, so excluded files never reach the tarball or the controllers.
+      Smaller artifacts mean faster downloads for every consumer and, more
+      importantly, no accidental apply of a stray YAML in `docs/`. When
+      `spec.ignore` is set it **replaces** Flux's default exclusion list
+      (`.git/`, `.github/`, images, archives...), so re-add anything you
+      still want dropped. The `/*` then `!/deploy` pattern is the idiom for
+      "ship only this directory".
+    hint: "A multi-line string: exclude /*, then negate the directory you want to keep."
+    expect: { type: regex, value: "(?s).*\\S.*" }
+    reveal: |
+      ignore: |
+        # exclude all
+        /*
+        # include deploy dir
+        !/deploy
+        # exclude file extensions from deploy dir
+        /deploy/**/*.md
+        /deploy/**/*.txt
+    gotchas:
+      - "A .sourceignore file at the repo root does the same job from the Git side; spec.ignore takes precedence over it."
+  - path: spec.timeout
+    title: "Timeout"
+    prompt: "Bound how long a single clone or fetch may take."
+    why: |
+      `timeout` caps the Git operation of one reconciliation (default
+      `60s`). A monorepo with a large history can exceed that on first
+      clone, which surfaces as a `context deadline exceeded` condition and a
+      source that never becomes Ready. Raise it for big repos; keep it well
+      below `interval` so a hung fetch cannot overlap the next tick.
+    hint: "A Go duration, longer than a cold clone of the repo but shorter than interval."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: "  timeout: 30s"
+final_manifest: |
+  apiVersion: source.toolkit.fluxcd.io/v1
+  kind: GitRepository
+  metadata:
+    name: podinfo
+    namespace: flux-system
+  spec:
+    interval: 1m
+    timeout: 30s
+    url: http://gitea.lab-gitea.svc.cluster.local:3000/lab/podinfo.git
+    ref:
+      branch: main
+    ignore: |
+      # exclude all
+      /*
+      # include deploy dir
+      !/deploy
+      # exclude file extensions from deploy dir
+      /deploy/**/*.md
+      /deploy/**/*.txt
+apply:
+  mode: dry-run
+  requires_addons: [flux]
+quiz:
+  - q: "Which controller downloads the artifact produced by this GitRepository?"
+    options:
+      - "source-controller re-reads it on each interval"
+      - "kustomize-controller or helm-controller, whichever consumes it through sourceRef"
+      - "notification-controller forwards it to the consumers"
+      - "The API server streams it from etcd"
+    answer: 1
+    explain: "source-controller produces and serves the tarball; consumers fetch it over HTTP from the source-controller Service."
+  - q: "You omit spec.ref entirely. What does Flux check out?"
+    options: ["The repository's default branch", "The master branch", "The latest tag", "Nothing: ref is required"]
+    answer: 1
+    explain: "GitRepository falls back to master, not to the remote HEAD, which breaks on repos whose default branch is main."
+  - q: "What does status.artifact.revision look like for a branch source in v1?"
+    options: ["main/abcdef0", "main@sha1:abcdef0...", "sha256:abcdef0...", "refs/heads/main"]
+    answer: 1
+    explain: "v1 uses <ref>@sha1:<commit>; Kustomization status.lastAppliedRevision shows the same string so you can compare them."

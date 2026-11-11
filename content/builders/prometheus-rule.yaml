@@ -1,0 +1,316 @@
+id: prometheus-rule
+title: "PrometheusRule: alerts and recording rules as code"
+kind: PrometheusRule
+apiVersion: monitoring.coreos.com/v1
+realm: manifests
+track: observability
+difficulty: intermediate
+estimated_minutes: 18
+summary: >
+  Build a PrometheusRule with an error-ratio alert that routes by
+  severity and a recording rule that precomputes request rate, and learn
+  how the for duration, labels and annotations behave from Prometheus to
+  Alertmanager.
+intro: |
+  A `PrometheusRule` is a rule file wrapped in a Kubernetes object. The
+  Prometheus Operator collects every PrometheusRule matched by the
+  Prometheus object's `ruleSelector` and `ruleNamespaceSelector`, writes
+  them into a ConfigMap mounted at `/etc/prometheus/rules/`, and the
+  config-reloader signals Prometheus. A rule rejected by Prometheus's
+  parser (bad PromQL, duplicate group name) stops the whole file from
+  loading, so one typo can silence every alert in the object.
+
+  Inside, `groups` are evaluated independently and in parallel, each on
+  its own `interval`; **rules within a group run sequentially**, which is
+  why a recording rule can feed an alert in the same group. An alerting
+  rule whose `expr` returns series is *pending*; once a series has been
+  present for `for`, it *fires* and is sent to Alertmanager with the
+  series labels plus the rule `labels`. Alertmanager routes on those
+  labels only; `annotations` are human text that travel with the
+  notification.
+prerequisites: [prometheus-servicemonitor]
+crd: true
+docs_url: https://prometheus-operator.dev/docs/developer/alerting/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the Prometheus Operator API."
+    why: |
+      Same group as ServiceMonitor: `monitoring.coreos.com/v1`. Rules
+      are Prometheus-side objects (they live in Prometheus, not in
+      Alertmanager), so there is no separate alerting group; Alertmanager
+      routing is configured through `AlertmanagerConfig`, a different CRD.
+    hint: "Same group as ServiceMonitor; version v1."
+    expect: { type: equals, value: monitoring.coreos.com/v1 }
+    reveal: "apiVersion: monitoring.coreos.com/v1"
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      One PrometheusRule holds one rule file. The Operator names the file
+      `<namespace>-<name>-<uid>.yaml`, and Prometheus requires group names
+      to be unique *per file*, not per server, so two PrometheusRules can
+      both contain a group called `podinfo`.
+    hint: "CamelCase, singular."
+    expect: { type: equals, value: PrometheusRule }
+    reveal: "kind: PrometheusRule"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the rule object."
+    why: |
+      Only used for the generated file name and for `kubectl`. Teams
+      usually keep one PrometheusRule per application or per SLO, so that
+      a parse error in one does not unload the rules of another.
+    hint: "Lowercase DNS label; suffixing -alerts or -rules is common."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: podinfo-alerts
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place the rules next to the application."
+    why: |
+      The namespace must be allowed by `ruleNamespaceSelector` on the
+      Prometheus object (kube-prometheus-stack allows all). Co-locating
+      rules with the app namespace lets the application team own its
+      alerts in Git, with Flux pruning them when the app goes away.
+    hint: "Same lab-* namespace as the ServiceMonitor."
+    expect: { type: regex, value: "^lab-[a-z0-9-]+$" }
+    reveal: "  namespace: lab-podinfo"
+  - path: metadata.labels.release
+    title: "The rule selector label"
+    prompt: "Label the object so the stack's Prometheus loads it."
+    why: |
+      Same trap as ServiceMonitor: kube-prometheus-stack sets
+      `ruleSelector` to `release: <release name>` unless
+      `ruleSelectorNilUsesHelmValues` is `false`. An unlabelled
+      PrometheusRule is accepted and ignored; `promtool` would have been
+      happy and nothing fires. Confirm with
+      `kubectl get prometheus -A -o jsonpath='{.items[*].spec.ruleSelector}'`.
+    hint: "Key release; value is the Helm release name of the stack."
+    expect: { type: equals, value: kube-prometheus-stack }
+    reveal: |
+      labels:
+        release: kube-prometheus-stack
+    gotchas:
+      - "The Operator also ignores PrometheusRules that fail validation at admission if the webhook is installed; read the kubectl apply error."
+  - path: spec.groups
+    title: "Rule groups"
+    prompt: "Open the groups list with one group named podinfo."
+    why: |
+      A group is the unit of evaluation and the unit of ordering. Rules in
+      a group are evaluated in sequence at every interval; groups are
+      independent and run in parallel. Put a recording rule and the alerts
+      that read it in the same group so the alert always sees the value
+      from the current cycle instead of the previous one.
+    hint: "A list of maps with name and rules."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, rules] } }
+    reveal: |
+      spec:
+        groups:
+          - name: podinfo
+            rules: []
+  - path: spec.groups[0].name
+    title: "Group name"
+    prompt: "Name the group."
+    why: |
+      Appears in the `rule_group` label of Prometheus's own evaluation
+      metrics (`prometheus_rule_group_last_duration_seconds`) and on the
+      Rules page, so you can see which group is slow. Must be unique
+      within this PrometheusRule.
+    hint: "Free text; app or SLO name."
+    expect: { type: regex, value: "^[A-Za-z0-9._/-]+$" }
+    reveal: "name: podinfo"
+  - path: spec.groups[0].interval
+    title: "Evaluation interval"
+    prompt: "Evaluate the group every minute."
+    why: |
+      Overrides the global `evaluationInterval` (30s in
+      kube-prometheus-stack). Alerts cannot react faster than this, and
+      `for` is counted in evaluations, so `for: 10m` with a 1m interval
+      means ten consecutive positive evaluations. Expensive expressions
+      over large series sets are the reason to lengthen it, not shorten
+      it.
+    hint: "A Prometheus duration."
+    expect: { type: regex, value: "^[0-9]+(ms|s|m|h)$" }
+    reveal: "interval: 1m"
+  - path: spec.groups[0].rules[0].alert
+    title: "Alert name"
+    prompt: "Define an alert called PodinfoHighErrorRate."
+    why: |
+      `alert` makes the rule an alerting rule (a rule has either `alert`
+      or `record`, never both). The value becomes the `alertname` label,
+      which is what Alertmanager groups and silences on by default and
+      what runbooks are indexed by. CamelCase without spaces is the
+      convention because it must be a valid label value that is easy to
+      type into `amtool silence add alertname=...`.
+    hint: "CamelCase, no spaces; it becomes the alertname label."
+    expect: { type: regex, value: "^[A-Z][A-Za-z0-9]*$" }
+    reveal: |
+      rules:
+        - alert: PodinfoHighErrorRate
+  - path: spec.groups[0].rules[0].expr
+    title: "Expression"
+    prompt: "Fire when more than 5% of podinfo requests return 5xx over 5 minutes."
+    why: |
+      The alert fires for **every series** the expression returns, so
+      aggregate deliberately: `sum by (job)` yields one alert per job,
+      no `by` yields one alert total, and forgetting to aggregate yields
+      one alert per Pod per status code. A ratio of rates is robust to
+      traffic volume; comparing raw counts is not. Guard the division
+      with a minimum traffic clause if low-traffic services produce noise.
+    hint: "A ratio of rate() sums, compared with a threshold; multi-line YAML is fine."
+    expect: { type: regex, value: "(?s).*\\S.*" }
+    reveal: |
+      expr: |
+        sum by (job) (rate(http_requests_total{job="podinfo", status=~"5.."}[5m]))
+          /
+        sum by (job) (rate(http_requests_total{job="podinfo"}[5m]))
+          > 0.05
+    gotchas:
+      - "The job label value is decided by the ServiceMonitor (jobLabel); if that changes, this selector matches nothing and the alert never fires."
+  - path: spec.groups[0].rules[0].for
+    title: "For duration"
+    prompt: "Require the condition to hold for 10 minutes."
+    why: |
+      Without `for`, an alert fires on the first positive evaluation and
+      resolves on the first negative one: a single slow scrape pages
+      someone. `for` keeps the alert *pending* until the series has been
+      continuously present for that long; a single evaluation where it
+      disappears resets the timer. Pick it from the SLO burn rate you are
+      willing to tolerate, not from gut feeling. A Prometheus restart shorter
+      than `--rules.alert.for-outage-tolerance` (default 1h) restores
+      pending/firing state from `ALERTS_FOR_STATE`; only longer outages reset
+      it.
+    hint: "A duration; think about how long a blip you are willing to ignore."
+    expect: { type: regex, value: "^[0-9]+(ms|s|m|h|d)$" }
+    reveal: "for: 10m"
+    gotchas:
+      - "keep_firing_for does the opposite: it keeps an alert firing for a while after the condition clears, which stops flapping notifications."
+  - path: spec.groups[0].rules[0].labels.severity
+    title: "Routing labels"
+    prompt: "Classify the alert as critical."
+    why: |
+      Rule labels are merged into every alert instance and are the only
+      thing Alertmanager's routing tree can match on. `severity` is the
+      conventional key: a route `match: severity: critical` goes to the
+      pager, `warning` to a channel. Labels also participate in grouping
+      and inhibition (`critical` silences `warning` for the same
+      alertname), so keep the vocabulary small and shared across teams.
+    hint: "A map under labels; the key everybody routes on."
+    expect: { type: oneOf, value: [critical, warning, info] }
+    reveal: |
+      labels:
+        severity: critical
+        team: platform
+    gotchas:
+      - "A label whose value is templated ({{ $labels.pod }}) works but creates a new alert identity each time, breaking grouping."
+  - path: spec.groups[0].rules[0].annotations.summary
+    title: "Summary annotation"
+    prompt: "Write a one-line summary."
+    why: |
+      Annotations are not labels: they do not influence routing, grouping
+      or identity, and they are re-rendered on every evaluation. That
+      makes them the place for anything dynamic. `summary` is what most
+      notification templates put in the title, so keep it under one line
+      and stable.
+    hint: "Short text; notification titles use it."
+    expect: { type: regex, value: "(?s).*\\S.*" }
+    reveal: |
+      annotations:
+        summary: "podinfo error rate above 5%"
+  - path: spec.groups[0].rules[0].annotations.description
+    title: "Templated description"
+    prompt: "Describe the alert using the current value and labels."
+    why: |
+      Annotations support Go templating with `$value` (the sample value
+      of the series) and `$labels` (its labels). `humanizePercentage`
+      turns `0.0732` into `7.32%`. This is the text the on-call engineer
+      reads at 3 a.m., so include what is broken, how badly, and a
+      `runbook_url` annotation next to it. Because the template is
+      rendered by Prometheus, the `{{ }}` must be quoted in YAML.
+    hint: "Quote the string; use {{ $value | humanizePercentage }} and {{ $labels.job }}."
+    expect: { type: regex, value: "(?s).*\\{\\{.*\\}\\}.*" }
+    reveal: |
+      description: "{{ $labels.job }} is returning {{ $value | humanizePercentage }} 5xx responses over the last 5 minutes."
+      runbook_url: https://runbooks.lab.local/podinfo/high-error-rate
+    gotchas:
+      - "A Flux Kustomization with postBuild substitution rewrites ${...} patterns; $value is safe, but ${VAR} in annotations needs the substitute: disabled annotation."
+  - path: spec.groups[0].rules[1].record
+    title: "Recording rule"
+    prompt: "Precompute the per-job request rate as job:http_requests:rate5m."
+    why: |
+      A recording rule evaluates an expression on every interval and
+      stores the result as a new series, so dashboards and alerts query a
+      cheap, already-aggregated metric instead of re-computing `rate()`
+      over thousands of series. The naming convention
+      `level:metric:operations` (`job:http_requests:rate5m`) encodes the
+      aggregation level and the function, so a reader knows what the
+      series means without opening the rule.
+    hint: "Colon-separated: aggregation level, metric name, operation."
+    expect: { type: regex, value: "^[a-zA-Z_][a-zA-Z0-9_]*:[a-zA-Z0-9_]+:[a-zA-Z0-9_]+$" }
+    reveal: "- record: job:http_requests:rate5m"
+  - path: spec.groups[0].rules[1].expr
+    title: "Recording expression"
+    prompt: "Sum the 5-minute request rate by job."
+    why: |
+      The output series carries exactly the labels the expression leaves
+      after aggregation (`job` here) plus `__name__`. Recording rules are
+      the raw material of SLO alerting: multi-window burn-rate alerts
+      compare `job:...:rate5m` with `job:...:rate1h` and cannot be
+      evaluated fast enough from raw counters. Because this rule is in the
+      same group as the alert, you could rewrite the alert to use it.
+    hint: "sum by (job) of a rate() over the counter."
+    expect: { type: regex, value: "(?s).*\\S.*" }
+    reveal: |
+      expr: sum by (job) (rate(http_requests_total[5m]))
+final_manifest: |
+  apiVersion: monitoring.coreos.com/v1
+  kind: PrometheusRule
+  metadata:
+    name: podinfo-alerts
+    namespace: lab-podinfo
+    labels:
+      release: kube-prometheus-stack
+  spec:
+    groups:
+      - name: podinfo
+        interval: 1m
+        rules:
+          - alert: PodinfoHighErrorRate
+            expr: |
+              sum by (job) (rate(http_requests_total{job="podinfo", status=~"5.."}[5m]))
+                /
+              sum by (job) (rate(http_requests_total{job="podinfo"}[5m]))
+                > 0.05
+            for: 10m
+            labels:
+              severity: critical
+              team: platform
+            annotations:
+              summary: "podinfo error rate above 5%"
+              description: "{{ $labels.job }} is returning {{ $value | humanizePercentage }} 5xx responses over the last 5 minutes."
+              runbook_url: https://runbooks.lab.local/podinfo/high-error-rate
+          - record: job:http_requests:rate5m
+            expr: sum by (job) (rate(http_requests_total[5m]))
+quiz:
+  - q: "An alert has for: 10m and the expression returns a series for 9 minutes, disappears for one evaluation, then returns. When does it fire?"
+    options:
+      - "After the original 10 minutes"
+      - "10 minutes after it returned: the pending timer reset"
+      - "Immediately on return"
+      - "Never; flapping alerts are suppressed"
+    answer: 1
+    explain: "A single negative evaluation resets pending state; the series must be continuously present for the whole for duration."
+  - q: "Which part of a rule does Alertmanager use to decide where to send the notification?"
+    options: ["annotations", "labels", "expr", "the group name"]
+    answer: 1
+    explain: "Routing, grouping, silencing and inhibition all match labels; annotations are only rendered into the message."
+  - q: "Why write a recording rule instead of putting the full expression in a dashboard?"
+    options:
+      - "Dashboards cannot use rate()"
+      - "The result is precomputed and stored, so queries and alerts over it are cheap and consistent"
+      - "Recording rules keep data longer"
+      - "Grafana requires it"
+    answer: 1
+    explain: "Recording rules trade a little storage for predictable query cost and a shared definition."

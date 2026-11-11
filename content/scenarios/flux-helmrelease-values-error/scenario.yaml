@@ -1,0 +1,54 @@
+id: flux-helmrelease-values-error
+title: "HelmRelease install fails on a bad value"
+realm: scenarios
+category: helm
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [flux, helmrelease, helm, values, helm-controller]
+requires_addons: [flux]
+summary: "A HelmRelease for podinfo has never installed since someone tuned its values. Read what helm-controller says, fix the values through Flux, and let it perform the release."
+brief: |
+  **Ticket #5412 — P2 — podinfo HelmRelease never installs**
+
+  podinfo is shipped with Flux's helm-controller: a `HelmRepository` pointing
+  at `https://stefanprodan.github.io/podinfo` and a `HelmRelease` named
+  `podinfo` in namespace `lab-helm` (chart `podinfo`, version `6.7.x`).
+  Someone "tuned the values in the HelmRelease" yesterday evening and since
+  then:
+
+      $ flux get helmreleases -n lab-helm
+      NAME      REVISION   SUSPENDED   READY   MESSAGE
+      podinfo              False       False   Helm install failed for release lab-helm/podinfo with chart podinfo@6.7.1: ...
+
+  `helm list -n lab-helm` shows the release in status `failed`, there is no
+  `podinfo` Pod, and the same chart installs fine on a laptop with default
+  values. Retrying with `flux reconcile` changes nothing.
+
+  ## Your task
+  - HelmRelease `podinfo` in `lab-helm` is `Ready=True` and its Helm release is in status `deployed` (`helm status -n lab-helm podinfo`).
+  - Fix it through the HelmRelease so that Flux performs the release; do not `helm install`/`helm upgrade` by hand.
+  - Deployment `podinfo` in `lab-helm` is available.
+namespace: lab-helm
+hints:
+  - "The full error is on the object, not in the terminal: kubectl describe helmrelease podinfo -n lab-helm   (conditions Ready, Released and Stalled; the Stalled reason explains why retries stopped)."
+  - "Helm kept the failed attempt: helm history -n lab-helm podinfo, and helm get values -n lab-helm podinfo shows exactly what Flux passed to the chart."
+  - "Rendered templates are plain YAML sent to the API server; Deployment.spec.replicas must be an integer, and YAML quotes make a string. kubectl get helmrelease podinfo -n lab-helm -o jsonpath='{.spec.values}'"
+  - "Edit spec.values in the HelmRelease (kubectl edit helmrelease podinfo -n lab-helm). A values change resets the failure counter and helm-controller retries at once; flux reconcile helmrelease podinfo -n lab-helm to hurry it."
+checks:
+  - name: "HelmRelease podinfo in lab-helm is Ready"
+    cmd: test "$(kubectl get helmrelease -n lab-helm podinfo -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True"
+  - name: "Flux performed the release: the HelmRelease history records the latest Helm release as deployed"
+    cmd: test "$(kubectl get helmrelease -n lab-helm podinfo -o jsonpath='{.status.history[0].status}')" = "deployed"
+  - name: "helm status reports the release as deployed"
+    cmd: helm status -n lab-helm podinfo -o json | grep -q '"status":"deployed"'
+  - name: "Deployment podinfo in lab-helm is available"
+    cmd: test "$(kubectl get deploy -n lab-helm podinfo -o jsonpath='{.status.availableReplicas}')" -ge 1
+  - name: "replicaCount in spec.values is a number (or left to the chart default)"
+    cmd: v=$(kubectl get helmrelease -n lab-helm podinfo -o jsonpath='{.spec.values.replicaCount}') && [[ "$v" =~ ^[0-9]*$ ]]
+concepts:
+  - "helm-controller runs the same Helm SDK code as the CLI: a HelmRelease is `helm install`/`upgrade` with `spec.values` as the values file, repeated on every interval and on every spec change. Whatever Helm would reject, Flux rejects, and the error text is Helm's. Builders: flux-helmrepository, flux-helmrelease."
+  - "Helm renders templates to YAML and sends them to the API server; a chart without a values.schema.json does not type-check values, so `replicaCount: \"two\"` becomes `replicas: two` and the API server refuses the Deployment. The release is still recorded, in status `failed`."
+  - "With `install.remediation.retries: 0` (the default) a failed install is not retried blindly: the HelmRelease is marked Stalled until the chart or the values change, which resets the failure counter. Fixing the values is the retry."
+  - "Bypassing Flux with `helm upgrade` by hand creates a revision the HelmRelease did not make; the next reconcile either reverts it or fights it. Fix the desired state, not the Helm storage."
+related_lessons: [gitops/helmrelease-with-flux]

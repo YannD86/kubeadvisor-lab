@@ -1,0 +1,55 @@
+id: flux-suspended-drift
+title: "Suspended Kustomization, drifted Deployment"
+realm: scenarios
+category: gitops
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [flux, kustomization, suspend, drift, server-side-apply, gitops]
+requires_addons: [gitea, flux]
+summary: "podinfo has zero Pods while Git says two and Flux reports Ready. Restore the desired state the GitOps way, without touching the Deployment by hand."
+brief: |
+  **Ticket #5230 — P1 — podinfo is down, "but Flux says everything is fine"**
+
+  Since this morning `http://podinfo.lab-drift-app.svc:9898` answers nothing.
+  Deployment `podinfo` in `lab-drift-app` shows **0/0** Pods. The repository
+  `flux-suspended-drift` (`deploy/podinfo/deployment.yaml`) clearly says
+  `replicas: 2` and the last commit is weeks old. The Flux objects are in
+  namespace `lab-drift`:
+
+      $ flux get kustomizations -n lab-drift
+      NAME      REVISION            SUSPENDED   READY   MESSAGE
+      podinfo   main@sha1:7c0d...   True        True    Applied revision: main@sha1:7c0d...
+
+  The change log of last night's maintenance window says "paused Flux on
+  podinfo to debug a probe issue, scaled down to isolate", then nothing. The
+  engineer who did it is unreachable. Someone on the bridge proposes
+  `kubectl scale --replicas=2` right now to stop the bleeding.
+
+  ## Your task
+  - Bring `podinfo` back to the state declared in Git **through Flux**, not with `kubectl scale`/`edit` on the Deployment.
+  - Kustomization `podinfo` in `lab-drift` is not suspended, is `Ready=True` and has reconciled its current generation.
+  - Deployment `podinfo` in `lab-drift-app` runs 2/2 replicas and still carries Flux's ownership labels.
+namespace: lab-drift
+hints:
+  - "Flux only corrects drift on objects it is allowed to reconcile. Look at the SUSPENDED column of flux get kustomizations -n lab-drift, and at the Deployment's events: nobody is fighting the scale-down."
+  - "kubectl get kustomization podinfo -n lab-drift -o jsonpath='{.spec.suspend}'   — a suspended object keeps its last status (Ready=True, Applied revision) forever; it describes the past, not the cluster now."
+  - "Resume it and let the controller re-apply what is in Git: flux resume kustomization podinfo -n lab-drift   (or kubectl patch it with spec.suspend=false)."
+  - "Watch the correction: kubectl get deploy -n lab-drift-app podinfo -w. Flux re-applies the Deployment with server-side apply and force=true, so replicas goes back to 2 without you editing anything."
+checks:
+  - name: "Kustomization podinfo in lab-drift is not suspended"
+    cmd: test "$(kubectl get kustomization -n lab-drift podinfo -o jsonpath='{.spec.suspend}')" != "true"
+  - name: "Kustomization is Ready and has reconciled its current generation (the resume was processed by Flux)"
+    cmd: test "$(kubectl get kustomization -n lab-drift podinfo -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True" && test "$(kubectl get kustomization -n lab-drift podinfo -o jsonpath='{.status.observedGeneration}')" = "$(kubectl get kustomization -n lab-drift podinfo -o jsonpath='{.metadata.generation}')"
+  - name: "Kustomization has applied a Git revision (status.lastAppliedRevision is set)"
+    cmd: test -n "$(kubectl get kustomization -n lab-drift podinfo -o jsonpath='{.status.lastAppliedRevision}')"
+  - name: "Deployment podinfo in lab-drift-app is back to the Git value (2 desired, 2 available)"
+    cmd: test "$(kubectl get deploy -n lab-drift-app podinfo -o jsonpath='{.spec.replicas}/{.status.availableReplicas}')" = "2/2"
+  - name: "Deployment is still owned by the Flux Kustomization (kustomize-controller labels present)"
+    cmd: test "$(kubectl get deploy -n lab-drift-app podinfo -o jsonpath='{.metadata.labels.kustomize\.toolkit\.fluxcd\.io/name}')" = "podinfo"
+concepts:
+  - "`spec.suspend: true` stops reconciliation entirely: no new revisions, no drift correction, no pruning. The object keeps its last Ready status, which is why 'Flux says fine' means nothing while SUSPENDED is True. Builder: flux-kustomization."
+  - "Drift correction is a side effect of Flux applying Git on every interval with server-side apply and `force: true`: any field set in Git (here `spec.replicas`) is taken back from whoever changed it (`kubectl scale`, a human in the UI)."
+  - "`kubectl scale --replicas=2` would have hidden the incident, not fixed it: the next person to suspend/resume would have found the same trap. Fix the control loop, then let the control loop fix the cluster."
+  - "Suspend is a legitimate tool (freeze during an incident, hold a risky revision) but it must be time-boxed and visible: an alert on `gotk_resource_info{suspended=\"True\"}` (kube-state-metrics) for more than an hour catches forgotten pauses."
+related_lessons: [gitops/flux-architecture]

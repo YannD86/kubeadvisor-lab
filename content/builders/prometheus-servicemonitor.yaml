@@ -1,0 +1,304 @@
+id: prometheus-servicemonitor
+title: "ServiceMonitor: tell Prometheus what to scrape"
+kind: ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+realm: manifests
+track: observability
+difficulty: intermediate
+estimated_minutes: 18
+summary: >
+  Build a ServiceMonitor for podinfo that a kube-prometheus-stack
+  Prometheus will actually pick up, with the selector label, a named port,
+  scrape tuning and relabelings, and learn the three reasons a
+  ServiceMonitor is silently ignored.
+intro: |
+  Prometheus itself knows nothing about ServiceMonitors. The
+  **Prometheus Operator** watches them, and for each one it generates a
+  `scrape_configs` job (`serviceMonitor/<ns>/<name>/<endpoint-index>`)
+  that uses `kubernetes_sd_configs` with role `endpoints` restricted to
+  the namespaces you selected, plus `relabel_configs` that keep only
+  targets whose **Service** labels match `spec.selector` and whose
+  endpoint port *name* matches `endpoints[].port`. The result is written
+  to the Secret `prometheus-<name>` and the config-reloader sidecar
+  reloads Prometheus.
+
+  Because every step of that chain is a selector, a ServiceMonitor fails
+  silently. The three classic causes: (1) the Prometheus object's
+  `serviceMonitorSelector` does not match the ServiceMonitor's labels
+  (kube-prometheus-stack defaults to `release: <helm release>`);
+  (2) `serviceMonitorNamespaceSelector` excludes its namespace; (3) the
+  ServiceMonitor's own selector or port name matches no Service or the
+  Service has no endpoints. Check in that order:
+  `kubectl get prometheus -A -o yaml | grep -A3 serviceMonitorSelector`,
+  then the targets page.
+prerequisites: [service-basics]
+crd: true
+docs_url: https://prometheus-operator.dev/docs/developer/getting-started/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the Prometheus Operator API."
+    why: |
+      All Prometheus Operator CRDs (Prometheus, Alertmanager,
+      ServiceMonitor, PodMonitor, PrometheusRule, Probe, ScrapeConfig)
+      share the `monitoring.coreos.com` group, a legacy of CoreOS
+      authorship. `v1` is the only served version for ServiceMonitor;
+      newer kinds such as ScrapeConfig are `v1alpha1`.
+    hint: "The group name still says coreos; version v1."
+    expect: { type: equals, value: monitoring.coreos.com/v1 }
+    reveal: "apiVersion: monitoring.coreos.com/v1"
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `ServiceMonitor` discovers targets through a Service's endpoints,
+      which gives you stable port names and Service-level labels.
+      `PodMonitor` skips the Service and selects Pods directly, useful for
+      workloads without a Service (DaemonSets, batch). Both produce the
+      same kind of scrape job; only the discovery differs.
+    hint: "The one that goes through a Service."
+    expect: { type: equals, value: ServiceMonitor }
+    reveal: "kind: ServiceMonitor"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the monitor after the service it scrapes."
+    why: |
+      The name becomes part of the generated job name
+      (`serviceMonitor/lab-podinfo/podinfo/0`) that you see on the
+      Prometheus targets page, so a descriptive name is your main
+      debugging aid. It does not have to equal the Service name.
+    hint: "Lowercase DNS label."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: podinfo
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place the monitor next to the application."
+    why: |
+      The ServiceMonitor's namespace must be allowed by the Prometheus
+      object's `serviceMonitorNamespaceSelector`. kube-prometheus-stack
+      sets it to `{}` (all namespaces), but a raw Prometheus CR with the
+      field unset watches **only its own namespace**, which is the second
+      classic reason for a missing target. Keeping the monitor with the
+      app also lets the team that owns the Service own its scraping.
+    hint: "Same namespace as the podinfo Service in this lab."
+    expect: { type: regex, value: "^lab-[a-z0-9-]+$" }
+    reveal: "  namespace: lab-podinfo"
+  - path: metadata.labels.release
+    title: "The selector label"
+    prompt: "Label the monitor so the kube-prometheus-stack Prometheus selects it."
+    why: |
+      This is reason number one. The Helm chart configures
+      `serviceMonitorSelector: {matchLabels: {release: <release name>}}`
+      unless `serviceMonitorSelectorNilUsesHelmValues` is set to `false`.
+      A ServiceMonitor without that label is valid, admitted, visible in
+      `kubectl get servicemonitors` and completely ignored: no job, no
+      target, no error anywhere. The value must equal the Helm release
+      name of the stack, which is `kube-prometheus-stack` by convention.
+    hint: "Key release; value is the Helm release name of the monitoring stack."
+    expect: { type: equals, value: kube-prometheus-stack }
+    reveal: |
+      labels:
+        release: kube-prometheus-stack
+    gotchas:
+      - "Check the exact expectation with: kubectl get prometheus -A -o jsonpath='{.items[*].spec.serviceMonitorSelector}'."
+  - path: spec.selector.matchLabels.app
+    title: "Which Services to scrape"
+    prompt: "Select Services labelled app: podinfo."
+    why: |
+      `spec.selector` is a label selector over **Service** objects, not
+      Pods. Services are often labelled differently from their Pods
+      (Helm charts put `app.kubernetes.io/name` on both, hand-written
+      manifests frequently label only the Pods), and that mismatch is
+      reason number three. The Operator turns this into a relabel rule on
+      `__meta_kubernetes_service_label_app`.
+    hint: "matchLabels on the Service's metadata.labels, not the Pod's."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      spec:
+        selector:
+          matchLabels:
+            app: podinfo
+    gotchas:
+      - "kubectl get svc -n lab-podinfo --show-labels is the fastest way to see what is actually there."
+  - path: spec.namespaceSelector.matchNames
+    title: "Namespaces to discover in"
+    prompt: "Restrict discovery to lab-podinfo."
+    why: |
+      `namespaceSelector` scopes *this* monitor's discovery: `matchNames`
+      lists namespaces, `any: true` means all. When omitted, only the
+      ServiceMonitor's own namespace is searched, which is usually what
+      you want. One monitor in a central namespace with `any: true` and a
+      selector like `metrics: enabled` is the common platform pattern for
+      opt-in scraping.
+    hint: "A list of namespace names under namespaceSelector."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      namespaceSelector:
+        matchNames:
+          - lab-podinfo
+  - path: spec.endpoints
+    title: "Endpoints"
+    prompt: "Open the endpoints list with one entry on the http port."
+    why: |
+      Each entry becomes one scrape job. `port` here is the **name** of a
+      Service port, which is why Service ports should always be named.
+      `targetPort` accepts a number or a container port name as a fallback,
+      but the generated relabel rule for `port` uses
+      `__meta_kubernetes_endpoint_port_name`, so an unnamed Service port
+      can never match.
+    hint: "A list of maps; the key is port and the value is a port name."
+    expect: { type: list, value: { min_items: 1, item_keys: [port] } }
+    reveal: |
+      endpoints:
+        - port: http
+  - path: spec.endpoints[0].port
+    title: "Port name, not number"
+    prompt: "Reference the Service port by name."
+    why: |
+      The field is a string and the Operator compares it to the Service
+      port's `name`. Writing `9797` matches nothing unless a port is
+      literally named `9797` (impossible: port names must contain a
+      letter). Podinfo's Service exposes its metrics on the same port as
+      HTTP, named `http`; many apps use a separate `metrics` port.
+    hint: "Lowercase, at most 15 characters, must contain a letter."
+    expect: { type: regex, value: "^(?=.*[a-z])[a-z0-9-]{1,15}$" }
+    reveal: "port: http"
+    gotchas:
+      - "If you only have a number, use targetPort: 9797 instead of port."
+  - path: spec.endpoints[0].path
+    title: "Metrics path"
+    prompt: "Scrape /metrics."
+    why: |
+      Defaults to `/metrics`, so writing it is documentation. It matters
+      for apps that expose metrics elsewhere (`/actuator/prometheus`,
+      `/q/metrics`) and for sidecar exporters. The Operator passes it as
+      `metrics_path` on the job.
+    hint: "An absolute path."
+    expect: { type: regex, value: "^/.*" }
+    reveal: "path: /metrics"
+  - path: spec.endpoints[0].interval
+    title: "Scrape interval"
+    prompt: "Scrape every 30 seconds."
+    why: |
+      Overrides the Prometheus global `scrapeInterval` for this job.
+      Shorter intervals multiply samples (cost: memory, disk, remote-write)
+      and only help if the app updates metrics that fast. Keep it a
+      multiple of the global evaluation interval so `rate()` windows cover
+      at least four samples; `rate(x[1m])` on a 30s scrape is borderline.
+    hint: "A Prometheus duration, e.g. 30s."
+    expect: { type: regex, value: "^[0-9]+(ms|s|m|h)$" }
+    reveal: "interval: 30s"
+  - path: spec.endpoints[0].scrapeTimeout
+    title: "Scrape timeout"
+    prompt: "Give up on a scrape after 10 seconds."
+    why: |
+      Must be **lower than or equal to** the interval. The Operator rejects
+      a ServiceMonitor whose timeout exceeds its interval (or the global
+      one): it logs the rejection and drops the monitor from the generated
+      config, a fourth way to be ignored. A timeout smaller than the app's
+      metrics handler latency produces `context deadline exceeded` targets
+      with no samples.
+    hint: "A duration not larger than interval."
+    expect: { type: regex, value: "^[0-9]+(ms|s|m|h)$" }
+    reveal: "scrapeTimeout: 10s"
+    gotchas:
+      - "Operator logs show 'scrapeTimeout greater than interval' for the rejected monitor; the Prometheus UI shows nothing."
+  - path: spec.endpoints[0].relabelings
+    title: "Target relabelings"
+    prompt: "Copy the Pod's node name into a node label."
+    why: |
+      `relabelings` run **before** the scrape on the discovered target's
+      meta labels (`__meta_kubernetes_*`): keep/drop targets, rename the
+      instance, copy Pod or Service labels. They are the only way to turn
+      discovery metadata into stored labels, since `__meta_*` labels are
+      discarded after relabeling. Each rule is Prometheus
+      `relabel_configs` syntax in camelCase.
+    hint: "A list of maps with action, sourceLabels, targetLabel."
+    expect: { type: list, value: { min_items: 1, item_keys: [action] } }
+    reveal: |
+      relabelings:
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+  - path: spec.endpoints[0].metricRelabelings
+    title: "Metric relabelings"
+    prompt: "Drop the Go GC histogram series before storage."
+    why: |
+      `metricRelabelings` run **after** the scrape on every sample, with
+      access to `__name__` and the series labels. This is where you fight
+      cardinality: dropping unused histogram families or high-cardinality
+      labels here means they never enter the TSDB. Dropping at the source
+      with `drop` is cheaper than ignoring in queries, and remote-write
+      bills are computed after this stage.
+    hint: "Same syntax; filter on __name__ with action drop."
+    expect: { type: list, value: { min_items: 1, item_keys: [action] } }
+    reveal: |
+      metricRelabelings:
+        - action: drop
+          sourceLabels: [__name__]
+          regex: go_gc_.*
+  - path: spec.jobLabel
+    title: "Job label"
+    prompt: "Use the Service's app label as the job name."
+    why: |
+      By default the `job` label of every scraped series is the
+      **Service name**. `jobLabel` names a Service label whose *value*
+      becomes `job` instead, so a Service called `podinfo-7c9f` from a
+      Helm fullname still reports `job="podinfo"`. Dashboards and
+      recording rules key on `job`, so decide this before shipping rules
+      that reference it.
+    hint: "The key of a Service label, not a value."
+    expect: { type: regex, value: "^[A-Za-z0-9._/-]+$" }
+    reveal: "jobLabel: app"
+final_manifest: |
+  apiVersion: monitoring.coreos.com/v1
+  kind: ServiceMonitor
+  metadata:
+    name: podinfo
+    namespace: lab-podinfo
+    labels:
+      release: kube-prometheus-stack
+  spec:
+    jobLabel: app
+    selector:
+      matchLabels:
+        app: podinfo
+    namespaceSelector:
+      matchNames:
+        - lab-podinfo
+    endpoints:
+      - port: http
+        path: /metrics
+        interval: 30s
+        scrapeTimeout: 10s
+        relabelings:
+          - action: replace
+            sourceLabels: [__meta_kubernetes_pod_node_name]
+            targetLabel: node
+        metricRelabelings:
+          - action: drop
+            sourceLabels: [__name__]
+            regex: go_gc_.*
+quiz:
+  - q: "A valid ServiceMonitor exists, the Service has endpoints, but no target appears. What do you check first?"
+    options:
+      - "The Pod's labels"
+      - "The Prometheus object's serviceMonitorSelector against the ServiceMonitor's labels"
+      - "The container port number"
+      - "Alertmanager"
+    answer: 1
+    explain: "The Operator only generates jobs for monitors matched by the Prometheus selector; a missing release label is the usual cause."
+  - q: "spec.selector.matchLabels is matched against which object's labels?"
+    options: ["Pods", "Services", "Endpoints", "Deployments"]
+    answer: 1
+    explain: "ServiceMonitor selects Services; PodMonitor selects Pods."
+  - q: "Where does a drop rule in metricRelabelings take effect?"
+    options:
+      - "At discovery, removing the target"
+      - "After the scrape, before samples are stored"
+      - "At query time"
+      - "In Alertmanager"
+    answer: 1
+    explain: "relabelings act on targets; metricRelabelings act on scraped samples."

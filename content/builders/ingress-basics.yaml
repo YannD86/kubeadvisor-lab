@@ -1,0 +1,333 @@
+id: ingress-basics
+title: "Ingress: HTTP routing rules for a controller you do not own"
+kind: Ingress
+apiVersion: networking.k8s.io/v1
+realm: manifests
+track: networking
+difficulty: intermediate
+estimated_minutes: 18
+summary: >
+  Expose the api Service under /api on shop.lab.test through ingress-nginx:
+  class selection, host and path rules, the three pathTypes, the backend
+  Service port, TLS termination, and the annotation escape hatch that makes
+  every Ingress controller-specific.
+intro: |
+  An Ingress is a list of HTTP routing rules. Like NetworkPolicy, the API
+  server only stores it; an **Ingress controller** (here ingress-nginx,
+  installed by the `ingress-nginx` addon and bound to localhost:80/443)
+  watches Ingress objects, Services and EndpointSlices, and renders them
+  into its own configuration, an nginx.conf in this case. The controller
+  then proxies straight to **Pod IPs** taken from the EndpointSlice, not to
+  the ClusterIP, which is why a Service with zero endpoints becomes a 503
+  from the controller rather than a connection error.
+
+  The Ingress API deliberately covers only the common ground: host, path,
+  backend, TLS. Everything else (rewrites, timeouts, body size, auth,
+  canary) is expressed through controller-specific **annotations**, which
+  is both the power and the portability problem of Ingress; the Gateway API
+  (`gateway-httproute`) is the typed replacement.
+
+  You will route `https://shop.lab.test/api/...` to the `api` Service with
+  the `/api` prefix stripped, which needs exactly one such annotation.
+prerequisites: [service-basics]
+crd: false
+docs_url: https://kubernetes.io/docs/concepts/services-networking/ingress/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the API group that owns Ingress."
+    why: |
+      Ingress graduated to `networking.k8s.io/v1` in 1.19; the
+      `extensions/v1beta1` and `networking.k8s.io/v1beta1` versions were
+      removed in 1.22. The v1 schema is stricter: `pathType` became
+      required, `backend.serviceName` became `backend.service.name`, and
+      the controller is selected by `ingressClassName` rather than the
+      `kubernetes.io/ingress.class` annotation. Most copy-pasted Ingress
+      snippets on the internet are the old shape.
+    hint: "Same group as NetworkPolicy; the stable version, not a beta."
+    expect: { type: equals, value: networking.k8s.io/v1 }
+    reveal: "apiVersion: networking.k8s.io/v1"
+    gotchas:
+      - "`backend.serviceName` / `servicePort` are v1beta1 fields; in v1 they are silently dropped by kubectl's pruning or rejected with --validate."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `Ingress` (`kubectl get ing`) is namespaced and its backends must be
+      Services in the same namespace; there is no cross-namespace backend.
+      Several Ingress objects can share a host: the controller merges them
+      into one virtual server, which lets each team own its own paths and
+      is also how two teams silently fight over the same path.
+    hint: "CamelCase, one word, alias ing."
+    expect: { type: equals, value: Ingress }
+    reveal: "kind: Ingress"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the Ingress."
+    why: |
+      The name is only an identifier, but it is what the controller logs
+      and what shows up in its `/metrics` labels
+      (`ingress="api"`). Keep one Ingress per routing concern: since
+      annotations apply to the **whole object**, a rewrite rule meant for
+      `/api` would also rewrite `/` if both paths lived in the same Ingress.
+      That is why the frontend at `/` gets a separate, annotation-free
+      Ingress.
+    hint: "Lowercase DNS name; one Ingress per set of annotations is the rule of thumb."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: api
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Put the Ingress with the Service it routes to."
+    why: |
+      Backends are resolved as `<service>.<ingress namespace>`; there is no
+      `namespace` field on a backend. The TLS Secret is looked up in the
+      same namespace too. An Ingress in the wrong namespace shows up in the
+      controller logs as `service lab-infra/api does not have any active
+      endpoints` and returns 503, which is also what a wrong Service name
+      looks like.
+    hint: "The namespace of the api Service; backends cannot cross namespaces."
+    expect: { type: regex, value: "^lab-[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+  - path: metadata.annotations
+    title: "Controller-specific behaviour: rewrite"
+    prompt: "Add the ingress-nginx rewrite-target annotation."
+    why: |
+      The Ingress API has no field for "strip the prefix". ingress-nginx
+      reads `nginx.ingress.kubernetes.io/rewrite-target` and emits an nginx
+      `rewrite` directive; `$1`, `$2` refer to capture groups in the path
+      regex you will write below. Traefik, HAProxy and the cloud controllers
+      ignore this annotation and have their own, so the same manifest
+      routes differently per controller. Annotations are validated by the
+      ingress-nginx admission webhook, which also runs on a server-side
+      dry-run.
+    hint: "metadata.annotations map, key nginx.ingress.kubernetes.io/rewrite-target. The value uses a capture group."
+    expect: { type: exists }
+    reveal: |
+      annotations:
+        nginx.ingress.kubernetes.io/rewrite-target: /$2
+    gotchas:
+      - "Annotations apply to every path in the object; mixing rewritten and non-rewritten paths in one Ingress breaks the latter."
+      - "`kubernetes.io/ingress.class` as an annotation is deprecated; use spec.ingressClassName. Setting both is rejected by some controllers."
+  - path: spec.ingressClassName
+    title: "Ingress class"
+    prompt: "Pick the controller that must implement this Ingress."
+    why: |
+      Several controllers can run in one cluster. `ingressClassName` names
+      an `IngressClass` object whose `spec.controller` identifies the
+      implementation; each controller only renders Ingresses of its class.
+      With no class set, only the IngressClass annotated
+      `ingressclass.kubernetes.io/is-default-class: "true"` picks it up, and
+      if none is marked default the Ingress is silently ignored by everyone:
+      no events, no address, no traffic.
+    hint: "kubectl get ingressclass shows the names; the addon installs the usual one."
+    expect: { type: equals, value: nginx }
+    reveal: |
+      spec:
+        ingressClassName: nginx
+    gotchas:
+      - "An Ingress with no class and no default IngressClass is ignored without any event; ADDRESS stays empty forever."
+  - path: spec.rules
+    title: "Rules list"
+    prompt: "Open the rules list with one host rule."
+    why: |
+      Each rule is one virtual host: a `host` and an `http` block with
+      paths. The controller matches the request's `Host` header against
+      rules in this object and in every other Ingress of the same class,
+      then the path. A rule without `host` is the catch-all for requests
+      whose Host matches nothing, which is where health checkers and
+      scanners land.
+    hint: "A list of maps, each with host and http."
+    expect: { type: list, value: { min_items: 1, item_keys: [host, http] } }
+    reveal: |
+      rules:
+        - host: shop.lab.test
+          http:
+            paths:
+              - path: /api(/|$)(.*)
+                pathType: ImplementationSpecific
+                backend:
+                  service:
+                    name: api
+                    port:
+                      number: 8080
+  - path: spec.rules[0].host
+    title: "Host"
+    prompt: "Set the virtual host."
+    why: |
+      Matched against the HTTP `Host` header (or TLS SNI for the
+      certificate), exact or with a single leading wildcard label
+      (`*.lab.test` matches `shop.lab.test`, not `a.b.lab.test`). It is not
+      resolved by the controller: DNS pointing this name at the controller's
+      address is your job, which in this lab means `curl -H "Host:
+      shop.lab.test" http://localhost/` or an `/etc/hosts` entry.
+    hint: "A DNS hostname, no scheme, no port. Nothing checks it resolves."
+    expect: { type: regex, value: '^(\*\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$' }
+    reveal: "- host: shop.lab.test"
+  - path: spec.rules[0].http.paths
+    title: "Paths list"
+    prompt: "Open the paths list with one path entry."
+    why: |
+      Paths are matched after the host; the controller picks the most
+      specific match across all Ingresses for that host, longest path first
+      and Exact before Prefix. Each entry carries its own `pathType` and
+      `backend`, so one host can fan out to many Services. Ordering in the
+      list does not matter; specificity does.
+    hint: "A list of maps with path, pathType, backend."
+    expect: { type: list, value: { min_items: 1, item_keys: [path, pathType, backend] } }
+    reveal: |
+      paths:
+        - path: /api(/|$)(.*)
+          pathType: ImplementationSpecific
+          backend:
+            service:
+              name: api
+              port:
+                number: 8080
+  - path: spec.rules[0].http.paths[0].path
+    title: "Path"
+    prompt: "Match /api and everything under it, capturing the remainder."
+    why: |
+      With a plain `Prefix` path `/api`, requests reach the backend as
+      `/api/orders`, which the api does not serve. The rewrite needs a
+      capture group, so the path becomes a regex: `/api(/|$)(.*)`. Group 1
+      is the slash or end-of-string that stops `/apiv2` from matching, group
+      2 is the remainder that `rewrite-target: /$2` forwards. `/api` becomes
+      `/`, `/api/orders` becomes `/orders`.
+    hint: "Starts with a slash. Two capture groups: a boundary and the rest."
+    expect: { type: regex, value: "^/.*" }
+    reveal: "- path: /api(/|$)(.*)"
+    gotchas:
+      - "A regex path with pathType Prefix is accepted by the API server but ingress-nginx only treats it as a regex under ImplementationSpecific or with use-regex."
+  - path: spec.rules[0].http.paths[0].pathType
+    title: "Path type"
+    prompt: "Choose how the path is interpreted."
+    why: |
+      Three values, required in v1. `Exact` matches the full path,
+      case-sensitively. `Prefix` matches by path *elements*: `/api` matches
+      `/api` and `/api/x` but not `/apiv2`, and the trailing slash is
+      ignored. `ImplementationSpecific` hands interpretation to the
+      controller; ingress-nginx treats it as a regex. Portable manifests use
+      Exact and Prefix; anything with a regex is pinned to a controller
+      and belongs in its own Ingress.
+    hint: "Three allowed values. Which one lets the controller see a regex?"
+    expect: { type: oneOf, value: [Prefix, Exact, ImplementationSpecific] }
+    reveal: "pathType: ImplementationSpecific"
+    gotchas:
+      - "Prefix is element-wise, not string-prefix: /foo does not match /foobar. People who expect string matching get 404s."
+  - path: spec.rules[0].http.paths[0].backend.service.name
+    title: "Backend Service"
+    prompt: "Name the Service that receives matching requests."
+    why: |
+      The controller resolves this Service to its EndpointSlice and proxies
+      to the **Pod IPs** directly (unless configured for `service-upstream`).
+      Consequences: a Service with no Ready endpoints yields a 503 from the
+      controller, the Service's `sessionAffinity` is bypassed, and the
+      Service only needs to exist, not to be reachable from the controller
+      Pod via its ClusterIP. A NetworkPolicy on the backend must therefore
+      allow the controller's Pods, not a ClusterIP.
+    hint: "The Service name in this namespace, not the Deployment or the Pod."
+    expect: { type: regex, value: "^[a-z]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      backend:
+        service:
+          name: api
+    gotchas:
+      - "503 from the controller with Running Pods means the Service has no Ready endpoints; check the selector and the readiness probe."
+  - path: spec.rules[0].http.paths[0].backend.service.port.number
+    title: "Backend port"
+    prompt: "Set the Service port to forward to."
+    why: |
+      `port.number` (or `port.name`) refers to the **Service** port, not the
+      container port; the controller then maps it through the Service to
+      the targetPort recorded in the EndpointSlice. Using `port.name: http`
+      ties the Ingress to the port name convention you set in
+      `service-basics` and survives a port renumbering. One of `number` or
+      `name` is required; both is an error.
+    hint: "The port of the api Service. An integer under port."
+    expect: { type: integer }
+    reveal: |
+      port:
+        number: 8080
+  - path: spec.tls
+    title: "TLS termination"
+    prompt: "Terminate TLS for the host with a certificate Secret."
+    why: |
+      `tls` is a list of host sets, each mapped to a Secret of type
+      `kubernetes.io/tls` in this namespace holding `tls.crt` and `tls.key`.
+      The controller serves that certificate for SNI matching the hosts;
+      hosts not listed here fall back to the controller's default
+      self-signed certificate, which is what browsers complain about. The
+      connection to the backend is plain HTTP unless annotations say
+      otherwise.
+    hint: "A list of maps with hosts (a list) and secretName."
+    expect: { type: list, value: { min_items: 1, item_keys: [hosts, secretName] } }
+    reveal: |
+      tls:
+        - hosts:
+            - shop.lab.test
+          secretName: shop-lab-test-tls
+  - path: spec.tls[0].secretName
+    title: "Certificate Secret"
+    prompt: "Name the Secret that holds the certificate."
+    why: |
+      Referenced by name, same namespace, and it does not need to exist at
+      apply time: ingress-nginx logs an error and serves the default
+      certificate until it appears. That is what makes the cert-manager
+      workflow possible: a `Certificate` (see `cert-manager-certificate`)
+      writes this Secret asynchronously and the controller picks it up on
+      the next sync. The `cert-manager.io/cluster-issuer` annotation is the
+      shortcut that creates the Certificate from the Ingress itself.
+    hint: "A Secret name; cert-manager can create it for you later."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: "secretName: shop-lab-test-tls"
+final_manifest: |
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: api
+    namespace: lab-build
+    annotations:
+      nginx.ingress.kubernetes.io/rewrite-target: /$2
+  spec:
+    ingressClassName: nginx
+    rules:
+      - host: shop.lab.test
+        http:
+          paths:
+            - path: /api(/|$)(.*)
+              pathType: ImplementationSpecific
+              backend:
+                service:
+                  name: api
+                  port:
+                    number: 8080
+    tls:
+      - hosts:
+          - shop.lab.test
+        secretName: shop-lab-test-tls
+apply:
+  mode: dry-run
+  requires_addons: [ingress-nginx]
+quiz:
+  - q: "pathType: Prefix with path /api. Which request does NOT match?"
+    options: ["/api", "/api/", "/api/orders", "/apiv2/orders"]
+    answer: 3
+    explain: "Prefix matching is per path element; /apiv2 is a different element, not an extension of /api."
+  - q: "The Ingress has no ingressClassName and the cluster has no default IngressClass. What do you observe?"
+    options:
+      - "The API server rejects it"
+      - "Every controller claims it"
+      - "No controller renders it; ADDRESS stays empty and there are no events"
+      - "It is served on port 80 only"
+    answer: 2
+    explain: "Class selection is how controllers filter; an unclassed Ingress without a default class belongs to nobody."
+  - q: "Requests return 503 from ingress-nginx although the api Pods are Running. Where do you look first?"
+    options:
+      - "The TLS Secret"
+      - "The Service's EndpointSlice: the controller proxies to Pod IPs and 503 means no Ready endpoints"
+      - "The IngressClass"
+      - "CoreDNS"
+    answer: 1
+    explain: "ingress-nginx bypasses the ClusterIP and uses endpoints directly; an empty slice (selector or readiness) is a 503."

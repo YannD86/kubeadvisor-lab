@@ -1,0 +1,48 @@
+id: pending-insufficient-resources
+title: "Reports service never comes up"
+realm: scenarios
+category: node
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [scheduling, resources, requests, pending]
+requires_addons: []
+summary: "Two Pods of the reports service have been Pending for 20 minutes on an almost idle cluster. The team wants more nodes; the scheduler event says otherwise."
+brief: |
+  **Ticket #5064 — P2 — reports service never comes up**
+
+  The `reports` Deployment in `lab-capacity` (2 replicas) has been `Pending`
+  since it was deployed 20 minutes ago. Nodes are Ready, nothing is cordoned
+  or tainted beyond the usual control-plane taint, and other workloads schedule
+  normally.
+
+  The reporting team copied the resource block from their production manifest
+  "to be safe" and says the numbers were reviewed. They believe the lab nodes
+  are simply too small and ask us to add two nodes.
+
+  ## Your task
+  - Both `reports` Pods must be Running.
+  - Right-size the workload instead of growing the cluster: the memory request
+    must be set and at most `512Mi`.
+  - Keep 2 replicas.
+namespace: lab-capacity
+hints:
+  - "kubectl describe pod -n lab-capacity -l app=reports | grep -A5 Events   FailedScheduling names the exact resource no node could offer."
+  - "Compare what the Pod asks for with what a node can give: kubectl get deploy reports -n lab-capacity -o jsonpath='{.spec.template.spec.containers[0].resources}'   and   kubectl describe node sre-labs-worker | grep -A6 Allocatable"
+  - "A request is a reservation, not a measurement. A request larger than any single node's allocatable memory can never be scheduled, however idle the cluster is. Read the unit suffix carefully: Gi versus Mi."
+  - "kubectl set resources deploy/reports -n lab-capacity --requests=cpu=10m,memory=64Mi --limits=memory=128Mi   then watch the Pods start."
+checks:
+  - name: "Memory request is set and at most 512Mi"
+    cmd: |
+      m="$(kubectl get deploy -n lab-capacity reports -o jsonpath='{.spec.template.spec.containers[0].resources.requests.memory}')"; test -n "$m" && echo "$m" | awk '{v=$0; mult=1; if (v ~ /Ki$/) mult=1024; else if (v ~ /Mi$/) mult=1024^2; else if (v ~ /Gi$/) mult=1024^3; else if (v ~ /Ti$/) mult=1024^4; else if (v ~ /k$/) mult=1000; else if (v ~ /M$/) mult=1000^2; else if (v ~ /G$/) mult=1000^3; else if (v ~ /T$/) mult=1000^4; else if (v ~ /m$/) mult=0.001; sub(/[A-Za-z]+$/, "", v); exit !(v*mult <= 512*1024*1024)}'
+  - name: "Deployment still has 2 replicas"
+    cmd: test "$(kubectl get deploy -n lab-capacity reports -o jsonpath='{.spec.replicas}')" = "2"
+  - name: "reports Deployment is 2/2 Ready"
+    cmd: test "$(kubectl get deploy -n lab-capacity reports -o jsonpath='{.status.readyReplicas}')" = "2"
+  - name: "No Pending Pods left in lab-capacity"
+    cmd: test "$(kubectl get pods -n lab-capacity --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l)" = "0"
+concepts:
+  - "A request is a scheduling reservation: the scheduler only considers nodes whose allocatable minus already-requested resources covers it. Actual usage is irrelevant; an idle node still cannot host a 64Gi request (see components/scheduler)."
+  - "Allocatable, not Capacity, is the budget: capacity minus kube-reserved, system-reserved and eviction thresholds. `kubectl describe node` shows both plus the 'Allocated resources' table of what is already promised."
+  - "Unit suffixes bite: `64Gi` versus `64Mi` is a 1000x difference and YAML will not warn you. A LimitRange with `max` per container, or an admission policy, turns the typo into an apply-time error instead of a 3 a.m. ticket."
+related_lessons: [troubleshooting/node-triage]

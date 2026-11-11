@@ -1,0 +1,45 @@
+id: node-cordoned
+title: "New release stuck Pending after maintenance"
+realm: scenarios
+category: node
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [scheduling, cordon, pending, maintenance]
+requires_addons: []
+summary: "Three Pods of a fresh release sit in Pending with tiny resource requests and Ready nodes. Read the scheduler's verdict and undo what maintenance left behind."
+brief: |
+  **Ticket #5033 — P1 — api release stuck, 0/3 Pods after the maintenance window**
+
+  The `api` Deployment in `lab-cordon` was rolled out at 06:10 and none of its
+  3 Pods have started. They sit in `Pending` with no node assigned. The image
+  is public, the resource requests are tiny, and the same manifest worked
+  yesterday in staging.
+
+  Overnight the platform team ran a kernel patch on the worker nodes. They say
+  every node rebooted fine and `kubectl get nodes` shows all of them `Ready`.
+
+  ## Your task
+  - All 3 `api` Pods must be Running, on worker nodes.
+  - Both worker nodes must accept new Pods again.
+  - Do not modify the Deployment (no tolerations, no nodeName tricks).
+namespace: lab-cordon
+hints:
+  - "Pending with no node means the scheduler could not place the Pod, and it says why in the Pod's events: kubectl describe pod -n lab-cordon -l app=api | grep -A5 Events"
+  - "Read the FailedScheduling message clause by clause: how many nodes exist, how many have an untolerated taint, how many are 'unschedulable'?"
+  - "kubectl get nodes   and look at the STATUS column. Ready,SchedulingDisabled is what a cordon looks like. Patching a node and forgetting to uncordon it afterwards is a classic."
+  - "kubectl uncordon sre-labs-worker sre-labs-worker2   then watch the Pods get scheduled: kubectl get pods -n lab-cordon -w"
+checks:
+  - name: "sre-labs-worker is schedulable"
+    cmd: test "$(kubectl get node sre-labs-worker -o jsonpath='{.spec.unschedulable}')" != "true"
+  - name: "sre-labs-worker2 is schedulable"
+    cmd: test "$(kubectl get node sre-labs-worker2 -o jsonpath='{.spec.unschedulable}')" != "true"
+  - name: "api Deployment is 3/3 Ready"
+    cmd: test "$(kubectl get deploy -n lab-cordon api -o jsonpath='{.status.readyReplicas}')" = "3"
+  - name: "Pods run on worker nodes and the Deployment was not modified"
+    cmd: test "$(kubectl get deploy -n lab-cordon api -o jsonpath='{.metadata.generation}')" = "1" && ! kubectl get pods -n lab-cordon -l app=api -o jsonpath='{.items[*].spec.nodeName}' | grep -q control-plane
+concepts:
+  - "A cordon is just `spec.unschedulable: true` on the Node object. It affects new scheduling decisions only; running Pods stay. `kubectl drain` cordons first, and the uncordon afterwards is a separate, easily forgotten step."
+  - "The FailedScheduling event is a census of the cluster: `0/3 nodes are available: 1 node(s) had untolerated taint ..., 2 node(s) were unschedulable`. Each clause is one scheduler filter rejecting a set of nodes (see components/scheduler)."
+  - "Control-plane nodes carry `node-role.kubernetes.io/control-plane:NoSchedule` by design; the fix for Pending app Pods is never to tolerate it."
+related_lessons: [troubleshooting/node-triage]

@@ -1,0 +1,46 @@
+id: secret-not-found
+title: "Payments Pods cannot find their credentials"
+realm: scenarios
+category: config
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [secret, envFrom, CreateContainerConfigError, events]
+requires_addons: []
+summary: "The payments Deployment in lab-secrets has 0/2 Pods up after the credentials were moved into a Secret. The Secret is there, the team swears. Read what the kubelet says."
+brief: |
+  **Ticket #5117 — P1 — payments rollout stuck at 0/2 Pods**
+
+  The payments team deployed a new version that loads its PSP credentials
+  from a Kubernetes Secret instead of a mounted file. The rollout in
+  namespace `lab-secrets` never completed: both new `payments` Pods are
+  `0/2 Ready`, there are no restarts and `kubectl logs` prints nothing.
+
+  The platform team's vault sync created the credentials Secret in the
+  namespace this morning and `kubectl get secrets -n lab-secrets` confirms a
+  Secret with the API key is present. The payments team says the manifest is
+  "exactly what the docs show" and asks us to check the cluster.
+
+  ## Your task
+  - Get both `payments` Pods `Running` and `1/1 Ready` in namespace `lab-secrets`.
+  - The container must see the real `API_KEY` (it starts with `pk_test_`) coming from a Secret via `envFrom`; do not paste credentials as literal env values.
+namespace: lab-secrets
+hints:
+  - "0/2 with no logs and no restarts: the containers were never created. `kubectl describe pod -n lab-secrets <pod>` and read the last Events; the kubelet says what it could not find."
+  - "The event quotes a Secret name in double quotes. Now `kubectl get secrets -n lab-secrets` and compare character by character."
+  - "kubectl get deploy payments -n lab-secrets -o jsonpath='{.spec.template.spec.containers[0].envFrom}' shows the name the Pod asks for. A one-letter difference is enough."
+  - "Point the Deployment at the Secret that actually exists: kubectl edit deploy payments -n lab-secrets (envFrom[0].secretRef.name). A rollout follows automatically."
+checks:
+  - name: "Deployment payments has 2 ready replicas"
+    cmd: kubectl rollout status -n lab-secrets deploy/payments --timeout=15s >/dev/null && test "$(kubectl get deploy -n lab-secrets payments -o jsonpath='{.status.readyReplicas}')" = "2"
+  - name: "No Pod is in CreateContainerConfigError"
+    cmd: test "$(kubectl get pods -n lab-secrets -l app=payments -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' | grep -c CreateContainerConfigError)" = "0"
+  - name: "The container sees the real API_KEY"
+    cmd: kubectl exec -n lab-secrets deploy/payments -- printenv API_KEY 2>/dev/null | grep -q '^pk_test_'
+  - name: "Credentials still come from a Secret through envFrom (no literal env value)"
+    cmd: test -n "$(kubectl get deploy -n lab-secrets payments -o jsonpath='{.spec.template.spec.containers[0].envFrom[*].secretRef.name}')" && test -z "$(kubectl get deploy -n lab-secrets payments -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="API_KEY")].value}')"
+concepts:
+  - "envFrom.secretRef resolves at container creation, on the kubelet. A missing Secret does not fail `kubectl apply`; it surfaces later as CreateContainerConfigError with the event `secret \"<name>\" not found`."
+  - "Events are the kubelet's error channel. `kubectl describe pod` (or `kubectl get events --sort-by=.lastTimestamp`) is the first command for any Pod that is not Running and has no logs."
+  - "References are strings: `api-credential` and `api-credentials` are two different objects. Diff names from the manifest against `kubectl get`, never from memory."
+related_lessons: [troubleshooting/config-triage]

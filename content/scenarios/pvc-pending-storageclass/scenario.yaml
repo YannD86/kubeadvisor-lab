@@ -1,0 +1,51 @@
+id: pvc-pending-storageclass
+title: "PVC Pending, Pod never scheduled"
+realm: scenarios
+category: storage
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 12
+tags: [pvc, storageclass, pending, provisioner]
+requires_addons: []
+summary: "The uploads service in lab-storage has been Pending since it was migrated with its PersistentVolumeClaim. The nodes are fine, the claim is tiny. Find out why nothing ever binds it."
+brief: |
+  **Ticket #5186 — P2 — uploads Pod Pending for an hour**
+
+  The `uploads` Deployment in namespace `lab-storage` was migrated from the
+  old cluster together with its manifests. Its single Pod has been `Pending`
+  since the migration, and the `data` PersistentVolumeClaim it mounts is
+  `Pending` too. The claim asks for 1Gi; the nodes have hundreds of GiB free.
+
+  The team confirmed the manifests are byte-for-byte what ran on the old
+  cluster. The platform team reminds everyone that this cluster offers one
+  StorageClass, `standard` (dynamic provisioning), and that creating extra
+  StorageClasses is not allowed.
+
+  ## Your task
+  - PVC `data` in `lab-storage` is `Bound` and uses the `standard` StorageClass (keep the name `data`; the Deployment references it).
+  - The `uploads` Pod is `Running` and `Ready` with the claim mounted at `/data`, and a file can be written there.
+  - No new StorageClass is created.
+namespace: lab-storage
+hints:
+  - "Two Pending objects: start with the one the other depends on. kubectl describe pvc data -n lab-storage and read the Events; then kubectl describe pod for the scheduler's message."
+  - "kubectl get storageclass lists what this cluster can provision. Compare with `spec.storageClassName` of the claim."
+  - "A PVC's storageClassName is immutable once created: editing it is rejected. Delete the claim and recreate it with `standard` (kubectl get pvc data -o yaml is a good starting point; drop status and the old class)."
+  - "The Pending Pod retries scheduling on its own once the claim is usable (the default class binds on first consumer). If it does not, delete the Pod; the Deployment recreates it."
+checks:
+  - name: "PVC data is Bound"
+    cmd: test "$(kubectl get pvc -n lab-storage data -o jsonpath='{.status.phase}')" = "Bound"
+  - name: "PVC data uses the standard StorageClass"
+    cmd: test "$(kubectl get pvc -n lab-storage data -o jsonpath='{.spec.storageClassName}')" = "standard"
+  - name: "Pod uploads is Running and Ready"
+    cmd: kubectl rollout status -n lab-storage deploy/uploads --timeout=20s >/dev/null && test "$(kubectl get deploy -n lab-storage uploads -o jsonpath='{.status.readyReplicas}')" = "1"
+  - name: "The Pod mounts PVC data (not an emptyDir)"
+    cmd: kubectl get deploy -n lab-storage uploads -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | grep -qw data
+  - name: "A file can be written to and read back from /data"
+    cmd: kubectl exec -n lab-storage deploy/uploads -- sh -c 'grep -q " /data " /proc/mounts && echo lab-storage-ok > /data/.probe && cat /data/.probe' | grep -q lab-storage-ok
+  - name: "No StorageClass fast-ssd was created"
+    cmd: test -z "$(kubectl get storageclass fast-ssd --ignore-not-found -o name)"
+concepts:
+  - "A PVC names a StorageClass; a provisioner watches that class and creates the PV. If no class with that name exists, nobody acts and the claim stays Pending forever, without an error on the Deployment."
+  - "An unbound PVC blocks scheduling: the Pod stays Pending with `pod has unbound immediate PersistentVolumeClaims`. Fix storage first, scheduling follows."
+  - "spec.storageClassName (and most of a PVC spec) is immutable. Recreate the claim; the pvc-protection finalizer only delays deletion while a *scheduled* Pod uses it."
+related_lessons: [troubleshooting/storage-and-rbac-triage]

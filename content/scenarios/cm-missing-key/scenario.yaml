@@ -1,0 +1,50 @@
+id: cm-missing-key
+title: "Pods stuck in CreateContainerConfigError"
+realm: scenarios
+category: config
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [configmap, env, CreateContainerConfigError, events]
+requires_addons: []
+summary: "The api Deployment in lab-config has not started a single Pod since a config refactor. No logs, no restarts, just a status nobody recognises. Find out what the kubelet cannot resolve."
+brief: |
+  **Ticket #5102 — P2 — api Pods never start after config refactor**
+
+  The backend team moved the database settings of their `api` service from a
+  hard-coded environment variable into the `app-config` ConfigMap this
+  afternoon. Since then both `api` Pods in namespace `lab-config` sit at
+  `0/1` with a status they have never seen before. There are no restarts and
+  `kubectl logs` returns nothing at all.
+
+  They checked that the ConfigMap exists (`kubectl get cm app-config` returns
+  it) and that the application still reads its connection string from the
+  `DATABASE_URL` environment variable, as it always did. They suspect "the
+  kubelet is broken".
+
+  ## Your task
+  - Get both `api` Pods `Running` and `1/1 Ready` in namespace `lab-config`.
+  - The container must see a non-empty `DATABASE_URL` environment variable.
+  - Keep the value in the `app-config` ConfigMap: no literal connection string in the Deployment, and do not delete the ConfigMap.
+namespace: lab-config
+hints:
+  - "No logs and no restarts means the container was never created. `kubectl describe pod -n lab-config <pod>` and read the Events at the bottom: the kubelet names exactly what it could not resolve."
+  - "The error mentions a ConfigMap *and* a key. `kubectl get cm app-config -n lab-config -o yaml`: do the keys match what the Deployment asks for? Keys are case-sensitive."
+  - "Compare both sides: kubectl get deploy api -n lab-config -o jsonpath='{.spec.template.spec.containers[0].env}' against the ConfigMap data."
+  - "Fix the reference, not the app: kubectl edit deploy api -n lab-config and correct configMapKeyRef.key (the env var *name* stays DATABASE_URL). Adding the missing key to the ConfigMap also works."
+checks:
+  - name: "Deployment api has 2 ready replicas"
+    cmd: kubectl rollout status -n lab-config deploy/api --timeout=15s >/dev/null && test "$(kubectl get deploy -n lab-config api -o jsonpath='{.status.readyReplicas}')" = "2"
+  - name: "No Pod is in CreateContainerConfigError"
+    cmd: test "$(kubectl get pods -n lab-config -l app=api -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' | grep -c CreateContainerConfigError)" = "0"
+  - name: "The container sees DATABASE_URL"
+    cmd: test -n "$(kubectl exec -n lab-config deploy/api -- printenv DATABASE_URL 2>/dev/null)"
+  - name: "DATABASE_URL still comes from the ConfigMap app-config (no literal value)"
+    cmd: test "$(kubectl get deploy -n lab-config api -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")].valueFrom.configMapKeyRef.name}')" = "app-config"
+  - name: "ConfigMap app-config still exists"
+    cmd: kubectl get cm -n lab-config app-config >/dev/null
+concepts:
+  - "CreateContainerConfigError means the kubelet could not build the container spec: a ConfigMap/Secret reference did not resolve. The image is fine, the app never ran, so there are no logs; the answer is always in `kubectl describe pod` Events."
+  - "configMapKeyRef has two names: the env var name the app reads (`name:`) and the key inside the ConfigMap (`key:`). They are independent and keys are case-sensitive."
+  - "A Pod stuck this way is retried by the kubelet on every sync (about every 10s). Fixing the reference or the ConfigMap is enough; no restart is needed."
+related_lessons: [troubleshooting/config-triage]

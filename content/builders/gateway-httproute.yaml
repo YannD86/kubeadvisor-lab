@@ -1,0 +1,322 @@
+id: gateway-httproute
+title: "HTTPRoute: typed routing on the Gateway API"
+kind: HTTPRoute
+apiVersion: gateway.networking.k8s.io/v1
+realm: manifests
+track: networking
+difficulty: intermediate
+estimated_minutes: 20
+summary: >
+  Route shop.lab.test to the web Service through a Gateway owned by another
+  team: parentRefs and listener attachment, hostnames, path matches, a
+  weighted canary across two backends, and a header filter. Learn the
+  GatewayClass/Gateway/Route role split and what it fixes compared to
+  Ingress.
+intro: |
+  The Gateway API splits what Ingress crammed into one object across three
+  roles. The infrastructure provider publishes a **GatewayClass** (which
+  controller implements it). The platform team creates a **Gateway** in its
+  own namespace: listeners, ports, TLS certificates, which namespaces may
+  attach. Application teams create **Routes** (`HTTPRoute`, `GRPCRoute`,
+  `TCPRoute`) in their own namespaces and *attach* them to a Gateway
+  listener. Each role is a different RBAC boundary, and a route can never
+  change a listener or a certificate it does not own.
+
+  Everything that was an annotation on Ingress is a typed field here:
+  weights, header manipulation, redirects, mirroring, timeouts. The same
+  HTTPRoute renders identically on Envoy Gateway, Istio, Cilium or NGINX
+  Gateway Fabric, which was never true of Ingress annotations.
+
+  HTTPRoute is a CRD: the Gateway API CRDs must be installed before the
+  API server knows the kind. This lab cluster does not ship them, so there
+  is no Apply button; the manifest is still validated here field by field.
+prerequisites: [ingress-basics]
+crd: true
+docs_url: https://gateway-api.sigs.k8s.io/api-types/httproute/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the Gateway API group and version."
+    why: |
+      Gateway API ships as CRDs from the SIG, versioned independently of
+      Kubernetes. `gateway.networking.k8s.io/v1` is the GA surface
+      (GatewayClass, Gateway, HTTPRoute, GRPCRoute since release 1.0/1.1);
+      experimental kinds and fields live in `v1alpha2`/`v1beta1` and in the
+      "experimental" channel CRD bundle. Writing `v1` on a cluster with only
+      the old CRDs yields `no matches for kind`, the same discovery error as
+      a missing CRD.
+    hint: "The SIG's group, stable version. Not networking.k8s.io."
+    expect: { type: equals, value: gateway.networking.k8s.io/v1 }
+    reveal: "apiVersion: gateway.networking.k8s.io/v1"
+    gotchas:
+      - "Check what is installed with `kubectl get crd | grep gateway.networking`; the gateway.networking.k8s.io/bundle-version annotation names the release."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the route kind for HTTP traffic."
+    why: |
+      Routes are per protocol: `HTTPRoute` for HTTP/HTTPS (after TLS
+      termination on the Gateway), `GRPCRoute` for gRPC method matching,
+      `TLSRoute` for SNI passthrough, `TCPRoute` and `UDPRoute` for raw L4.
+      A listener declares which kinds may attach to it, so a `TCPRoute`
+      cannot bind to an HTTPS listener. HTTPRoute is namespaced and lives
+      with the application, not with the Gateway.
+    hint: "CamelCase, the protocol followed by Route."
+    expect: { type: equals, value: HTTPRoute }
+    reveal: "kind: HTTPRoute"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the route."
+    why: |
+      The route name appears in the Gateway's `status.listeners[].attachedRoutes`
+      count and in the implementation's metrics and access logs. One route
+      per application is the norm; because rules inside a route have no
+      annotations and filters are per rule, there is no reason to split a
+      route the way you split Ingress objects.
+    hint: "Lowercase DNS name; usually the application it routes."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: web
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Put the route with the application."
+    why: |
+      The route lives in the app team's namespace and its `backendRefs`
+      default to that namespace. Attaching to a Gateway elsewhere is
+      allowed only if that Gateway's listener says so
+      (`allowedRoutes.namespaces`: `Same`, `All`, or a `Selector` on
+      namespace labels). That rule is enforced by the Gateway owner, not
+      by the route author, which is the whole point of the role split.
+    hint: "The application namespace, not the Gateway's."
+    expect: { type: regex, value: "^lab-[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+  - path: spec.parentRefs
+    title: "Parent references"
+    prompt: "Open parentRefs with one entry naming the Gateway."
+    why: |
+      `parentRefs` is the attachment: a list because one route can bind to
+      several Gateways (internal and external) or several listeners. The
+      controller checks each ref and writes a per-parent entry in
+      `status.parents[]` with an `Accepted` condition; `ResolvedRefs` tells
+      you whether the backends resolved. A route that is not attached
+      produces no traffic and no error anywhere except this status.
+    hint: "A list of maps; name is required, namespace and sectionName narrow it."
+    expect: { type: list, value: { min_items: 1, item_keys: [name] } }
+    reveal: |
+      spec:
+        parentRefs:
+          - name: shop-gateway
+            namespace: lab-gateway
+            sectionName: https
+  - path: spec.parentRefs[0].namespace
+    title: "Gateway namespace"
+    prompt: "Point at the Gateway in the platform namespace."
+    why: |
+      Defaults to the route's own namespace when omitted. Cross-namespace
+      attachment is the common production shape (one shared Gateway, many
+      app namespaces) and it needs *no* ReferenceGrant: the Gateway's
+      listener `allowedRoutes` is the handshake. ReferenceGrant is only
+      required in the other direction, for a route that targets a Service
+      in a namespace other than its own.
+    hint: "Where the platform team runs the shared Gateway."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "namespace: lab-gateway"
+    gotchas:
+      - "status.parents[].conditions Accepted=False with reason NotAllowedByListeners means the Gateway owner has not opened the listener to your namespace."
+  - path: spec.parentRefs[0].sectionName
+    title: "Listener"
+    prompt: "Attach to one listener by name."
+    why: |
+      A Gateway has several listeners (`http` on 80, `https` on 443, maybe
+      `metrics`). `sectionName` binds the route to one of them by its
+      `listeners[].name`; omit it and the route attaches to every listener
+      that allows it, which usually means you serve the app on plain HTTP
+      by accident. `port` is the alternative selector when listener names
+      are not stable.
+    hint: "The listeners[].name of the Gateway you want; think about which one does TLS."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "sectionName: https"
+  - path: spec.hostnames
+    title: "Hostnames"
+    prompt: "Restrict the route to the shop hostname."
+    why: |
+      The route's hostnames are intersected with the listener's `hostname`:
+      a listener for `*.lab.test` accepts a route for `shop.lab.test`, and a
+      route for `shop.example.com` is rejected with `NoMatchingListenerHostname`.
+      Omit the list and the route takes every hostname the listener accepts.
+      Hostnames are matched against the Host header; TLS SNI is the
+      Gateway's concern, not the route's.
+    hint: "A list of strings; it must fit inside what the listener allows."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      hostnames:
+        - shop.lab.test
+  - path: spec.rules[0].matches[0].path.type
+    title: "Path match type"
+    prompt: "Match on a path prefix."
+    why: |
+      `PathPrefix` is element-wise like Ingress Prefix; `Exact` is exact;
+      `RegularExpression` is implementation-specific syntax. A `matches`
+      entry can also carry `headers`, `queryParams` and `method`, all ANDed
+      inside one entry; several entries are ORed. When routes conflict, the
+      spec defines precedence (exact over prefix, longer prefix, more
+      header matches, then older route), so two teams cannot shadow each
+      other by accident.
+    hint: "Three types; the one that behaves like Ingress Prefix."
+    expect: { type: oneOf, value: [PathPrefix, Exact, RegularExpression] }
+    reveal: |
+      rules:
+        - matches:
+            - path:
+                type: PathPrefix
+                value: /
+  - path: spec.rules[0].matches[0].path.value
+    title: "Path value"
+    prompt: "Match the root prefix."
+    why: |
+      With `PathPrefix` and `/`, every request on the hostname matches,
+      which is the catch-all for a frontend. Prefix stripping is not an
+      annotation here: it is the `URLRewrite` filter with
+      `path.type: ReplacePrefixMatch`, typed and portable. The spec also
+      forbids a path value that does not start with `/`, which the CRD
+      schema enforces at admission.
+    hint: "Starts with a slash. The frontend wants everything."
+    expect: { type: regex, value: "^/.*" }
+    reveal: "value: /"
+  - path: spec.rules[0].backendRefs
+    title: "Backends with weights (canary)"
+    prompt: "Send traffic to two Services with weights."
+    why: |
+      `backendRefs` is a list and each entry may carry a `weight`; traffic
+      is split proportionally per request, not per connection. This is the
+      canary that Ingress needed `canary-weight` annotations for, and it is
+      portable. `port` is mandatory because a Service may expose several.
+      If one backend is invalid (missing Service, unresolved ReferenceGrant),
+      the spec says requests for *its share* get a 500, not a silent
+      fallback to the other: a broken canary is visible immediately.
+    hint: "A list of maps with name, port and weight; two entries for a canary."
+    expect: { type: list, value: { min_items: 2, item_keys: [name, port, weight] } }
+    reveal: |
+      backendRefs:
+        - name: web
+          port: 80
+          weight: 90
+        - name: web-canary
+          port: 80
+          weight: 10
+    gotchas:
+      - "A backend in another namespace needs a ReferenceGrant in that namespace, or ResolvedRefs goes False with RefNotPermitted."
+  - path: spec.rules[0].backendRefs[0].weight
+    title: "Weight semantics"
+    prompt: "Give the stable backend its share."
+    why: |
+      Weights are relative integers, not percentages: 90/10 and 9/1 are the
+      same split. A backend without `weight` gets 1, and `weight: 0`
+      receives nothing, which is how you park a backend before removing it.
+      Because the split is per request, a client with keep-alive will see
+      both versions during a session; sticky canaries need a header match
+      rule in front of the weighted one.
+    hint: "An integer; the ratio to the other backend is what matters."
+    expect: { type: integer }
+    reveal: "weight: 90"
+  - path: spec.rules[0].filters[0].type
+    title: "Filter: request header modifier"
+    prompt: "Add a RequestHeaderModifier filter to the rule."
+    why: |
+      Filters are typed transformations applied before forwarding. Only
+      `RequestHeaderModifier` and `RequestRedirect` are Core (every
+      implementation must support them); `ResponseHeaderModifier`,
+      `URLRewrite` and `RequestMirror` are Extended, so check your
+      implementation's conformance report; `ExtensionRef` points at
+      implementation CRDs. A filter at rule level applies to every
+      backend of the rule; a filter under a `backendRefs` entry applies only
+      to that backend, which is how you tag canary traffic alone.
+    hint: "filters is a list under the rule; type names the filter, a sibling key configures it."
+    expect: { type: equals, value: RequestHeaderModifier }
+    reveal: |
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Request-Origin
+                value: shop-gateway
+            remove:
+              - X-Debug
+  - path: spec.rules[0].filters[0].requestHeaderModifier.set
+    title: "Headers to set"
+    prompt: "Set a header identifying the gateway, and remove a debug header."
+    why: |
+      `set` overwrites a header if the client sent it, `add` appends a
+      value, `remove` deletes. Use `set` for anything security-relevant
+      (an origin tag, a tenant id) so that a client cannot smuggle its own
+      value through; use `add` only for diagnostic breadcrumbs. Header names
+      are case-insensitive and the CRD schema rejects duplicates in the same
+      list.
+    hint: "set is a list of name/value maps under requestHeaderModifier. set beats add for anything trusted."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, value] } }
+    reveal: |
+      set:
+        - name: X-Request-Origin
+          value: shop-gateway
+    gotchas:
+      - "add on a header the client already sent produces two values; downstream code that reads the first one will read the client's."
+final_manifest: |
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+    name: web
+    namespace: lab-build
+    labels:
+      app: web
+  spec:
+    parentRefs:
+      - name: shop-gateway
+        namespace: lab-gateway
+        sectionName: https
+    hostnames:
+      - shop.lab.test
+    rules:
+      - matches:
+          - path:
+              type: PathPrefix
+              value: /
+        filters:
+          - type: RequestHeaderModifier
+            requestHeaderModifier:
+              set:
+                - name: X-Request-Origin
+                  value: shop-gateway
+              remove:
+                - X-Debug
+        backendRefs:
+          - name: web
+            port: 80
+            weight: 90
+          - name: web-canary
+            port: 80
+            weight: 10
+quiz:
+  - q: "Who decides whether an HTTPRoute in lab-build may attach to a Gateway in lab-gateway?"
+    options:
+      - "The route author, via parentRefs"
+      - "A ReferenceGrant in lab-build"
+      - "The Gateway owner, via the listener's allowedRoutes.namespaces"
+      - "The GatewayClass"
+    answer: 2
+    explain: "Attachment is accepted by the parent. ReferenceGrant governs the other direction: a route reaching a Service in a foreign namespace."
+  - q: "backendRefs has web (weight 90) and web-canary (weight 10), but the web-canary Service does not exist. What do clients see?"
+    options:
+      - "All traffic goes to web"
+      - "About 10% of requests get a 500 from the gateway"
+      - "The route is rejected"
+      - "The gateway retries on web"
+    answer: 1
+    explain: "The spec requires an invalid backend's share to fail, so a broken canary is visible instead of silently absorbed."
+  - q: "Which Ingress concept does a Gateway listener replace?"
+    options:
+      - "The backend Service"
+      - "The pathType"
+      - "spec.tls and the controller's port binding, owned by the platform team instead of the app"
+      - "IngressClass"
+    answer: 2
+    explain: "Listeners hold port, protocol, hostname and TLS certificates; routes can only attach, never change them. IngressClass maps to GatewayClass."

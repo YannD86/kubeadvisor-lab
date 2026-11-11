@@ -1,0 +1,241 @@
+id: helm-chart-yaml
+title: "Chart.yaml: the identity card of a Helm chart"
+kind: Chart
+apiVersion: v2
+realm: manifests
+track: helm
+difficulty: beginner
+estimated_minutes: 15
+summary: >
+  Write a complete Chart.yaml for a podinfo application chart: versions,
+  Kubernetes constraint, a conditional Redis dependency, maintainers and
+  keywords, and learn which fields Helm enforces and which only tooling
+  reads.
+intro: |
+  `Chart.yaml` is the only mandatory file of a chart (even `templates/`
+  is optional). It is not a Kubernetes object (no `kind`, no
+  `metadata`) but Helm parses it strictly: `helm lint`, `helm package`,
+  `helm install` and Flux's source-controller all refuse a chart whose
+  metadata is wrong, and a wrong *type* in a field is the most common
+  `helm lint` failure (a number where a string is expected; the other
+  commands silently coerce it to a string).
+
+  Two versions live here. `version` is the **chart** version, the thing
+  `helm search` lists and `HelmRelease.spec.chart.spec.version` ranges
+  over; it must change whenever anything in the chart changes.
+  `appVersion` is the version of the software the chart deploys and is
+  used by templates as the default image tag. Dependencies declared here
+  are resolved by `helm dependency update` into `Chart.lock` and
+  downloaded into `charts/`; source-controller does the same at build time
+  for charts stored in Git.
+prerequisites: []
+crd: false
+docs_url: https://helm.sh/docs/topics/charts/#the-chartyaml-file
+steps:
+  - path: apiVersion
+    title: "Chart API version"
+    prompt: "Declare the Chart.yaml format."
+    why: |
+      `v2` is the Helm 3 format: dependencies live in this file (Helm 2
+      used `requirements.yaml`), `type` and `kubeVersion` are recognised
+      and library charts exist. Helm 3 still installs `v1` charts for
+      compatibility, but `helm create` and every current repository emit
+      `v2`. There is no `v3`.
+    hint: "A single character after v; Helm 3 charts use the second format."
+    expect: { type: equals, value: v2 }
+    reveal: "apiVersion: v2"
+    gotchas:
+      - "Flux rejects a Chart.yaml without apiVersion with 'validation: chart.metadata.apiVersion is required'."
+  - path: name
+    title: "Chart name"
+    prompt: "Name the chart."
+    why: |
+      The name is what `index.yaml` and OCI registries key on, what
+      `helm pull <repo>/<name>` resolves, and what `.Chart.Name` returns
+      in templates (most charts build object names from it). The packaged
+      file is `<name>-<version>.tgz`, and subcharts in `charts/` are
+      matched to `dependencies` by this field, so the chart directory
+      should carry the same name.
+    hint: "Lowercase, DNS-friendly; conventionally equal to the directory name."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "name: podinfo"
+  - path: description
+    title: "Description"
+    prompt: "Describe the chart in one sentence."
+    why: |
+      Free text shown by `helm search` and Artifact Hub. It is the only
+      place a user sees before pulling the chart, so say what the chart
+      installs and what it needs (a database, an ingress controller),
+      not what the software is.
+    hint: "One line; appears in helm search output."
+    expect: { type: regex, value: "(?s).*\\S.*" }
+    reveal: "description: Podinfo web application with optional Redis cache"
+  - path: type
+    title: "Chart type"
+    prompt: "Declare an installable application chart."
+    why: |
+      `application` (the default) is a chart that renders templates and
+      can be installed. `library` charts cannot be installed and their
+      templates are not rendered; they only provide named templates
+      (`define`) that other charts `include` after declaring them as a
+      dependency. Setting `type: library` on a chart with real manifests
+      is a silent way to render nothing.
+    hint: "Two values exist; this one has templates to install."
+    expect: { type: oneOf, value: [application, library] }
+    reveal: "type: application"
+  - path: version
+    title: "Chart version"
+    prompt: "Give the chart a SemVer 2 version."
+    why: |
+      Strict SemVer: `MAJOR.MINOR.PATCH` with optional pre-release and
+      build metadata. `helm package` refuses anything else, and
+      repositories index by it. Bump it on **every** change to templates,
+      values or dependencies: a repository will not accept the same version
+      twice, and Flux's HelmChart will not notice a modified chart whose
+      version did not change.
+    hint: "Three numeric components; quoting is optional but harmless."
+    expect: { type: regex, value: "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$" }
+    reveal: "version: 1.2.0"
+    gotchas:
+      - "version: 1.2 is read as a float and coerced to the string 1.2: helm package accepts it (as 1.2.0) but helm lint fails with 'version should be of type string but it's of type float64'. Write full MAJOR.MINOR.PATCH and quote it."
+  - path: appVersion
+    title: "Application version (quoted)"
+    prompt: "Record the version of podinfo this chart deploys, as a string."
+    why: |
+      `appVersion` is informational for Helm but operational for
+      templates: `helm create` generates
+      `image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"`.
+      It is typed as a string, but a value YAML reads as a number
+      (`appVersion: 1`, `appVersion: 6.7`) does not fail: Helm coerces it
+      to a string, so `appVersion: 1.0` silently becomes `"1"` and only
+      `helm lint` complains (`appVersion should be of type string but it's
+      of type float64`). Always quote it. It does not need to be SemVer.
+    hint: "Double-quote it; it should match the image tag the chart defaults to."
+    expect: { type: regex, value: "^[A-Za-z0-9._-]+$" }
+    reveal: "appVersion: \"6.7.1\""
+    gotchas:
+      - "Bumping appVersion without bumping version is a no-op for every consumer: the chart artifact is identical."
+  - path: kubeVersion
+    title: "Kubernetes version constraint"
+    prompt: "Require Kubernetes 1.25 or newer, including pre-release builds."
+    why: |
+      A SemVer constraint checked by `helm install` against the cluster
+      version; a mismatch fails before rendering. The `-0` suffix matters:
+      `>=1.25.0` **excludes** pre-release versions, and managed clusters
+      report versions like `v1.28.3-eks-e71ada9` or `1.27.3-gke.100`, which
+      SemVer treats as pre-releases. `>=1.25.0-0` accepts them.
+    hint: "A constraint string; think about EKS/GKE version strings."
+    expect: { type: regex, value: "^[~^>=<! ,0-9.xX*-]+$" }
+    reveal: "kubeVersion: \">=1.25.0-0\""
+    gotchas:
+      - "Flux reports this as 'chart requires kubeVersion: >=1.25.0 which is incompatible with Kubernetes v1.27.3-gke.100'."
+  - path: dependencies
+    title: "Dependencies"
+    prompt: "Declare Redis as a subchart from its repository."
+    why: |
+      Each dependency needs `name`, `version` (a range is allowed) and
+      `repository` (an `https://` repo, an `oci://` registry, a
+      `file://../path` for local charts or `@alias` of a `helm repo add`).
+      `helm dependency update` resolves ranges, writes the exact result to
+      `Chart.lock` and downloads tarballs into `charts/`. Commit
+      `Chart.lock`, not `charts/*.tgz`, and run `helm dependency build`
+      from the lock in CI for reproducibility.
+    hint: "A list of maps; each needs name, version, repository."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, version, repository] } }
+    reveal: |
+      dependencies:
+        - name: redis
+          version: "~20.0.0"
+          repository: https://charts.bitnami.com/bitnami
+          condition: redis.enabled
+    gotchas:
+      - "source-controller resolves dependencies itself for charts in Git, but only if Chart.yaml and Chart.lock agree; a stale lock fails the build."
+  - path: dependencies[0].condition
+    title: "Dependency condition"
+    prompt: "Make the subchart optional through a values flag."
+    why: |
+      `condition` is a dotted path into the parent's values. If it
+      resolves to `false` the subchart is skipped entirely; if the path is
+      **missing**, the dependency is enabled. The convention
+      `<subchart>.enabled` keeps the switch next to the subchart's values
+      (`redis.enabled: false` disables and also hides `redis.*`). Several
+      paths can be comma-separated; the first one that exists wins.
+      `tags` offers group toggles but conditions take precedence.
+    hint: "A values path; by convention it ends in .enabled."
+    expect: { type: regex, value: "^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$" }
+    reveal: "condition: redis.enabled"
+    gotchas:
+      - "Forgetting to add redis.enabled to values.yaml means the subchart is always installed, because an absent condition counts as true."
+  - path: maintainers
+    title: "Maintainers"
+    prompt: "List who owns the chart."
+    why: |
+      A list of `name`, optional `email` and `url`. Artifact Hub and
+      `helm show chart` surface it; some organisations lint for it so an
+      on-call engineer knows whom to page about a chart. It has no effect
+      on installation.
+    hint: "A list of maps with at least name."
+    expect: { type: list, value: { min_items: 1, item_keys: [name] } }
+    reveal: |
+      maintainers:
+        - name: platform-team
+          email: platform@lab.local
+  - path: keywords
+    title: "Keywords"
+    prompt: "Add search keywords."
+    why: |
+      Plain strings used by `helm search repo` and Artifact Hub to match
+      queries that do not contain the chart name. Cheap discoverability:
+      a chart named `podinfo` is found by `helm search repo demo` only if
+      `demo` is a keyword.
+    hint: "A list of strings."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      keywords:
+        - podinfo
+        - demo
+        - go
+final_manifest: |
+  apiVersion: v2
+  name: podinfo
+  description: Podinfo web application with optional Redis cache
+  type: application
+  version: 1.2.0
+  appVersion: "6.7.1"
+  kubeVersion: ">=1.25.0-0"
+  home: https://github.com/stefanprodan/podinfo
+  sources:
+    - https://github.com/stefanprodan/podinfo
+  keywords:
+    - podinfo
+    - demo
+    - go
+  maintainers:
+    - name: platform-team
+      email: platform@lab.local
+  dependencies:
+    - name: redis
+      version: "~20.0.0"
+      repository: https://charts.bitnami.com/bitnami
+      condition: redis.enabled
+quiz:
+  - q: "You change a template, keep version 1.2.0 and push to the Git repo Flux watches. What does the HelmRelease do?"
+    options:
+      - "Upgrades because the chart contents changed"
+      - "Nothing: the chart artifact is identified by version, so no new HelmChart artifact is produced"
+      - "Fails with a version conflict"
+      - "Reinstalls from scratch"
+    answer: 1
+    explain: "Chart identity is name+version; bump version for every change."
+  - q: "You write appVersion: 6.7 (unquoted) in Chart.yaml. What happens?"
+    options:
+      - "helm install fails: 6.7 is not SemVer"
+      - "helm install fails: YAML parses it as a float and the field is a string"
+      - "helm package fails: appVersion must match version"
+      - "Nothing fails at install: Helm coerces it to the string \"6.7\"; only helm lint reports the type, and 1.0 would silently become \"1\""
+    answer: 3
+    explain: "Helm converts a YAML number into the string field, so install, template and package succeed; the real hazards are silent reformatting (1.0 becomes 1) and a helm lint error. Quote it."
+  - q: "A dependency has condition: redis.enabled and values.yaml does not define redis.enabled. Is the subchart installed?"
+    options: ["No, missing means false", "Yes, a missing condition path counts as enabled", "Helm errors", "Only with --set redis.enabled=true"]
+    answer: 1
+    explain: "Absent condition paths are treated as true; define the flag explicitly."

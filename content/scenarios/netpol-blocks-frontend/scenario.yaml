@@ -1,0 +1,51 @@
+id: netpol-blocks-frontend
+title: "Frontend times out after the zero-trust baseline"
+realm: scenarios
+category: network
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [networkpolicy, calico, ingress, timeout]
+requires_addons: []
+summary: "The storefront frontend can no longer reach its backend: every call times out although Pods and endpoints are healthy. Open the right door without removing the lock."
+brief: |
+  **Ticket #4910 — P1 — storefront shows "backend unavailable"**
+
+  Since this morning the storefront in namespace `lab-netpol` renders an error
+  page. The `frontend` Pod logs show every call to `http://backend` timing out
+  (`curl: (28) Connection timed out`, HTTP code `000`). The `backend` Pods are
+  `Running`, `Ready`, the Service has endpoints, and `kubectl port-forward` to
+  a backend Pod returns `200`. DNS resolves `backend` correctly.
+
+  The security team rolled out a "zero-trust baseline" to several namespaces
+  last night. They insist it stays: it is an audit requirement, and removing
+  it would be reverted by their automation within minutes anyway.
+
+  ## Your task
+  - `frontend` must get HTTP 200 from `http://backend` (port 80) again.
+  - The policy `default-deny-ingress` must remain in place and unchanged.
+  - Open only what is needed: Pods other than `frontend` must still be unable
+    to reach `backend`.
+namespace: lab-netpol
+hints:
+  - "Timeouts (not connection refused) while endpoints exist mean packets are dropped on the path, not rejected by a listener. Inside a cluster the usual packet filter is NetworkPolicy, enforced by the CNI (Calico here)."
+  - "kubectl get networkpolicy -n lab-netpol ; kubectl describe networkpolicy default-deny-ingress -n lab-netpol   An empty podSelector ({}) selects every Pod in the namespace, and Ingress with no rules means deny all."
+  - "NetworkPolicies are additive. You cannot punch a hole in a deny policy by editing it; you add a second policy that selects backend and allows ingress from the frontend Pods on TCP 80. Both policies then apply and the union wins."
+  - >-
+    Minimal allow policy: podSelector app=backend, policyTypes [Ingress], ingress.from podSelector app=frontend, ports TCP 80.
+    Test it with: kubectl exec -n lab-netpol deploy/frontend -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://backend
+checks:
+  - name: "default-deny-ingress still exists and still denies everything (selector {} and no ingress rules)"
+    cmd: kubectl get networkpolicy -n lab-netpol default-deny-ingress -o jsonpath='{.spec.policyTypes[*]}' | grep -q Ingress && test "$(kubectl get networkpolicy -n lab-netpol default-deny-ingress -o jsonpath='{.spec.podSelector}')" = "{}" && test -z "$(kubectl get networkpolicy -n lab-netpol default-deny-ingress -o jsonpath='{.spec.ingress}')"
+  - name: "A second NetworkPolicy (the allow rule) exists in lab-netpol"
+    cmd: test "$(kubectl get networkpolicy -n lab-netpol --no-headers | grep -vc '^default-deny-ingress ')" -ge 1
+  - name: "frontend Pod gets HTTP 200 from backend"
+    cmd: kubectl exec -n lab-netpol deploy/frontend -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://backend | grep -q 200
+  - name: "Other Pods are still blocked (the allow rule is scoped to frontend, not allow-all)"
+    cmd: "! kubectl run -n lab-netpol probe-$RANDOM --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- -s -o /dev/null -w '%{http_code}' --max-time 3 http://backend 2>/dev/null | grep -q 200"
+concepts:
+  - "NetworkPolicy is an allow-list: once any policy selects a Pod for Ingress, that Pod accepts only traffic matched by the union of all policies selecting it. Policies never conflict, they add up, so the fix is always a new allow policy, never an edit of the deny."
+  - "`podSelector: {}` selects every Pod in the policy's namespace; with `policyTypes: [Ingress]` and no `ingress` rules it is a default-deny. If you also add an Egress deny, remember to allow UDP/TCP 53 to kube-system or DNS dies too."
+  - "Dropped packets look like timeouts; rejected connections look like connection refused. That difference tells you whether to inspect filtering (policy, firewall) or listeners (ports, endpoints)."
+  - "Policy is enforced by the CNI. Calico enforces it; on a CNI without policy support the objects are accepted and silently ignored (see components/cni-and-coredns)."
+related_lessons: [troubleshooting/network-triage]

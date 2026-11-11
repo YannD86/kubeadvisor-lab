@@ -1,0 +1,26 @@
+# python
+api/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# web
+web/node_modules/
+web/.next/
+web/out/
+web/*.tsbuildinfo
+web/next-env.d.ts
+# local
+logs/
+*.log
+.env.local
+# kubectl discovery cache written when kubectl runs with cwd as home
+.kube/
+# platform
+logs-*.txt
+*.db
+*.db-wal
+*.db-shm
+deploy/.env.*
+!deploy/env.*.example
+# public test builds
+dist/

@@ -1,0 +1,346 @@
+id: flux-kustomization
+title: "Flux Kustomization: reconcile a path from a source"
+kind: Kustomization
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+realm: manifests
+track: flux
+difficulty: intermediate
+estimated_minutes: 20
+summary: >
+  Build the Flux Kustomization that applies deploy/overlays/dev from the
+  podinfo source into lab-podinfo, with pruning, health gating, an
+  explicit dependency and variable substitution, and learn what each
+  field changes in kustomize-controller's reconcile loop.
+intro: |
+  A Flux `Kustomization` (group `kustomize.toolkit.fluxcd.io`) is **not**
+  the `kustomization.yaml` file that `kubectl kustomize` reads; that file
+  has its own builder (`kustomize-kustomization`). This object is an
+  instruction to `kustomize-controller`:
+
+  1. fetch the artifact of `sourceRef` from source-controller;
+  2. run `kustomize build` on `path` (generating a `kustomization.yaml` on
+     the fly if the directory has none);
+  3. substitute `postBuild` variables;
+  4. **server-side apply** everything with field manager
+     `kustomize-controller`, record the applied objects in
+     `status.inventory`;
+  5. **prune** inventory entries that disappeared from the build;
+  6. optionally wait for health, then write `status.lastAppliedRevision`.
+
+  The loop runs on `interval`, on every new source artifact, and on demand
+  (`flux reconcile ks`). Dependencies, timeouts and health checks decide
+  *when* a reconciliation is allowed to start and when it counts as
+  successful, which is what other Kustomizations' `dependsOn` reads.
+prerequisites: [flux-gitrepository]
+crd: true
+docs_url: https://fluxcd.io/flux/components/kustomize/kustomizations/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the Flux kustomize API, not the kustomize.config.k8s.io one."
+    why: |
+      Two different objects are called Kustomization. The one served by
+      `kustomize-controller` is `kustomize.toolkit.fluxcd.io/v1`; the file
+      kustomize itself reads is `kustomize.config.k8s.io/v1beta1`. Mixing
+      them is a classic: the API server accepts neither
+      `kustomize.config.k8s.io` as a resource (it is not registered) nor
+      Flux fields on a kustomize file.
+    hint: "The group ends in toolkit.fluxcd.io and the stable version is v1."
+    expect: { type: equals, value: kustomize.toolkit.fluxcd.io/v1 }
+    reveal: "apiVersion: kustomize.toolkit.fluxcd.io/v1"
+    gotchas:
+      - "`kustomize.toolkit.fluxcd.io/v1beta2` is no longer served (removed in Flux 2.8); v1 made spec.prune required and dropped spec.validation, so migrate old manifests with flux migrate."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `Kustomization` here is a reconciliation unit: one source path, one
+      inventory, one Ready condition. Granularity is a design choice. One
+      object per application gives independent pruning and health; one
+      object for a whole cluster means a single broken manifest blocks
+      everything behind it.
+    hint: "Same word as the kustomize file, different API group."
+    expect: { type: equals, value: Kustomization }
+    reveal: "kind: Kustomization"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the reconciliation after the application it manages."
+    why: |
+      The name is stamped on every applied object as the label
+      `kustomize.toolkit.fluxcd.io/name` (with `/namespace`), which is how
+      `flux tree ks podinfo` and the prune step find what this object owns.
+      It is also what other Kustomizations put in `dependsOn`, so it is
+      effectively an API.
+    hint: "Lowercase DNS label; dependents will write it in dependsOn."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: podinfo
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Keep the Kustomization next to the Flux controllers."
+    why: |
+      The Kustomization's own namespace is where its status lives and the
+      default for `sourceRef.namespace` and `dependsOn[].namespace`. It is
+      *not* where the manifests land: that is decided by the manifests
+      themselves or by `targetNamespace`. Keeping orchestration objects in
+      `flux-system` and workloads in `lab-*` namespaces is the convention
+      used by every scenario in this lab.
+    hint: "The namespace Flux was installed in."
+    expect: { type: equals, value: flux-system }
+    reveal: "  namespace: flux-system"
+  - path: spec.interval
+    title: "Interval"
+    prompt: "Set how often the controller re-applies even without a new commit."
+    why: |
+      New artifacts trigger an apply immediately; `interval` is the
+      **drift-correction** period. Every tick re-runs the build and the
+      server-side apply, which reverts manual `kubectl edit` changes to
+      fields Flux owns. `interval` is also the default for `timeout` and
+      `retryInterval`, so a 10m interval means a failed apply is retried
+      after 10m unless you set `retryInterval` lower.
+    hint: "Go duration; 5m-10m is typical for apps, 1m for fast feedback in a lab."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: |
+      spec:
+        interval: 10m
+    gotchas:
+      - "A suspended Kustomization (spec.suspend: true) stops this loop entirely; drift accumulates silently (see scenario flux-suspended-drift)."
+  - path: spec.sourceRef.kind
+    title: "Source kind"
+    prompt: "Say which kind of source to pull the artifact from."
+    why: |
+      `sourceRef` is the link to source-controller. Accepted kinds are
+      `GitRepository`, `OCIRepository`, `Bucket` and, since Flux 2.7 behind
+      the `ExternalArtifact` feature gate, `ExternalArtifact` for third-party
+      source controllers. The controller
+      **watches** the referenced source: a new `status.artifact.revision`
+      on it triggers a reconcile of this Kustomization within seconds,
+      which is why you rarely need a short `interval` here.
+    hint: "The kind you built in flux-gitrepository."
+    expect: { type: oneOf, value: [GitRepository, OCIRepository, Bucket, ExternalArtifact] }
+    reveal: |
+      sourceRef:
+        kind: GitRepository
+  - path: spec.sourceRef.name
+    title: "Source name"
+    prompt: "Reference the podinfo source by name."
+    why: |
+      Must match `metadata.name` of the source exactly. When it does not,
+      the condition reads `Source 'GitRepository/flux-system/podinf' not
+      found` and the Kustomization stays in `ArtifactFailed` until the
+      source appears: Flux does not fail permanently, it waits and retries,
+      so ordering between source and Kustomization manifests does not
+      matter.
+    hint: "metadata.name of the GitRepository."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  name: podinfo"
+  - path: spec.sourceRef.namespace
+    title: "Source namespace"
+    prompt: "State the source namespace explicitly."
+    why: |
+      When omitted, `sourceRef.namespace` defaults to the Kustomization's
+      own namespace. That is invisible while both live in `flux-system`,
+      and breaks the day you move an app Kustomization into `lab-podinfo`:
+      the source is suddenly looked up in the wrong namespace. Writing it
+      explicitly also documents a cross-namespace reference, which cluster
+      admins can forbid with the controller flag
+      `--no-cross-namespace-refs=true` (multi-tenant lockdown).
+    hint: "The namespace where the GitRepository object lives."
+    expect: { type: equals, value: flux-system }
+    reveal: "  namespace: flux-system"
+    gotchas:
+      - "In multi-tenancy mode a tenant Kustomization may only reference sources in its own namespace; the error is 'cross-namespace references are not allowed'."
+  - path: spec.path
+    title: "Path inside the artifact"
+    prompt: "Build the dev overlay."
+    why: |
+      `path` is a directory **relative to the artifact root** (the repo
+      root after `ignore`). The controller runs `kustomize build` there; if
+      the directory has no `kustomization.yaml`, Flux generates one that
+      includes every `*.yaml`/`*.yml` in the tree. A wrong path fails with
+      `kustomization path not found`, and a path that exists but is empty
+      applies nothing and happily prunes everything you deployed before
+      (scenario `flux-kustomization-wrong-path`).
+    hint: "Starts with ./ and names the overlay directory, not a file."
+    expect: { type: regex, value: "^\\./.+" }
+    reveal: "path: ./deploy/overlays/dev"
+    gotchas:
+      - "A path pointing at a file instead of a directory is rejected."
+  - path: spec.prune
+    title: "Prune"
+    prompt: "Enable garbage collection of objects removed from Git."
+    why: |
+      `prune` is required in `v1`. With `true`, objects recorded in
+      `status.inventory` that no longer appear in the build are deleted:
+      delete the manifest in Git and the resource goes away. With `false`,
+      removed manifests leave orphans that nobody manages. Prune only
+      touches objects this Kustomization applied (identified by inventory
+      and the `kustomize.toolkit.fluxcd.io/name` label); objects created by
+      Helm, by other Kustomizations or by hand are never considered.
+    hint: "A boolean; v1 makes it mandatory."
+    expect: { type: boolean }
+    reveal: "prune: true"
+    gotchas:
+      - "Protect an object from pruning with the annotation kustomize.toolkit.fluxcd.io/prune: disabled (useful for PVCs and namespaces)."
+      - "Deleting the Kustomization object itself prunes its whole inventory, unless spec.deletionPolicy says otherwise."
+  - path: spec.targetNamespace
+    title: "Target namespace"
+    prompt: "Force every namespaced object into lab-podinfo."
+    why: |
+      `targetNamespace` overrides the namespace of every namespaced object
+      in the build, even ones that set `metadata.namespace`, letting one
+      overlay be deployed several times (dev, staging) from the same path.
+      Cluster-scoped objects are untouched. Flux does not create the
+      namespace for you: it must exist already, be part of the build, or be
+      created by a Kustomization you depend on.
+    hint: "App namespaces in this lab are prefixed lab-."
+    expect: { type: regex, value: "^lab-[a-z0-9-]+$" }
+    reveal: "targetNamespace: lab-podinfo"
+  - path: spec.wait
+    title: "Wait for all objects, or only health checks?"
+    prompt: "Decide whether readiness is computed on every applied object (true) or on the explicit list in healthChecks (false)."
+    why: |
+      With `wait: true` the controller runs a kstatus health check on
+      **every** object it applied and the `healthChecks` list is ignored.
+      It is the right default for small apps. With `wait: false`, only the
+      objects listed in `healthChecks` gate readiness, which is cheaper for
+      large builds and lets you ignore noisy kinds. Either way, Ready is
+      only reported after the checks pass, and Ready is exactly what other
+      Kustomizations' `dependsOn` waits for.
+    hint: "A boolean. The next step adds an explicit list, so pick the setting that honours it."
+    expect: { type: boolean }
+    reveal: "wait: false"
+    gotchas:
+      - "wait: true plus a healthChecks list is not an error, but the list is silently ignored."
+  - path: spec.timeout
+    title: "Timeout"
+    prompt: "Bound the apply and health-check phase."
+    why: |
+      `timeout` covers build, apply and health checking of one
+      reconciliation and defaults to `interval`. If a Deployment is
+      crash-looping, the health check waits the full timeout before the
+      Kustomization goes `HealthCheckFailed`; too long and dependents hang,
+      too short and slow rollouts (image pulls, PVC provisioning) are
+      reported as failures and retried.
+    hint: "A Go duration shorter than interval but longer than a normal rollout."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: "timeout: 2m"
+  - path: spec.healthChecks
+    title: "Health checks"
+    prompt: "List the objects whose readiness defines success: the podinfo Deployment."
+    why: |
+      Each entry is an object reference (`apiVersion`, `kind`, `name`,
+      `namespace`) evaluated with kstatus: Deployments must have all
+      replicas updated and available, Jobs must complete, custom resources
+      must expose a `Ready` condition with matching `observedGeneration`.
+      Until the list is healthy the Kustomization is not Ready, and
+      anything that `dependsOn` it is not reconciled. This is how a
+      database Kustomization can block the app that needs it.
+    hint: "A list of maps with apiVersion, kind, name, namespace; note the namespace after targetNamespace."
+    expect: { type: list, value: { min_items: 1, item_keys: [apiVersion, kind, name, namespace] } }
+    reveal: |
+      healthChecks:
+        - apiVersion: apps/v1
+          kind: Deployment
+          name: podinfo
+          namespace: lab-podinfo
+    gotchas:
+      - "The namespace must be the one the object ends up in (after targetNamespace), not the Kustomization's namespace."
+  - path: spec.dependsOn
+    title: "Depends on"
+    prompt: "Do not start until the namespaces Kustomization is Ready."
+    why: |
+      `dependsOn` lists other Flux Kustomizations (`name`, optional
+      `namespace`). The controller checks each dependency's `Ready`
+      condition before starting a reconciliation; while any is not Ready,
+      this one is requeued with `dependency ... is not ready`. Combined
+      with `wait`/`healthChecks` on the dependency, this yields real
+      ordering (CRDs before CRs, namespaces before workloads). It is a
+      scheduling hint, not a lock: a dependency going unhealthy later does
+      not undo this one.
+    hint: "A list of maps with name; the dependency must exist or you get 'dependency not found'."
+    expect: { type: list, value: { min_items: 1, item_keys: [name] } }
+    reveal: |
+      dependsOn:
+        - name: namespaces
+    gotchas:
+      - "A typo here blocks forever with 'dependency flux-system/namespace not found' (scenario flux-dependency-missing)."
+      - "Dependencies only work between Flux Kustomizations; to depend on a HelmRelease, make a Kustomization that health-checks it."
+  - path: spec.postBuild.substitute
+    title: "Variable substitution"
+    prompt: "Provide values for ${...} placeholders in the manifests."
+    why: |
+      After `kustomize build`, the controller runs a bash-style envsubst on
+      the output: `${CLUSTER_ENV}` and `${REPLICAS:=1}` (with default) are
+      replaced from `substitute` and from `substituteFrom` ConfigMaps or
+      Secrets. This is the Flux way to share one overlay between clusters
+      without a template engine. All values must be **strings**: the CRD
+      schema is `map[string]string`, so an unquoted `2` is rejected at
+      admission.
+    hint: "postBuild.substitute is a map of string values; quote numbers."
+    expect: { type: exists }
+    reveal: |
+      postBuild:
+        substitute:
+          CLUSTER_ENV: dev
+          REPLICAS: "2"
+    gotchas:
+      - "Substitution runs on every manifest, so a literal ${...} in a PrometheusRule or script is mangled (a bare $var without braces is left alone, and $${var} escapes); opt a resource out with the annotation kustomize.toolkit.fluxcd.io/substitute: disabled."
+final_manifest: |
+  apiVersion: kustomize.toolkit.fluxcd.io/v1
+  kind: Kustomization
+  metadata:
+    name: podinfo
+    namespace: flux-system
+  spec:
+    interval: 10m
+    retryInterval: 1m
+    timeout: 2m
+    sourceRef:
+      kind: GitRepository
+      name: podinfo
+      namespace: flux-system
+    path: ./deploy/overlays/dev
+    prune: true
+    targetNamespace: lab-podinfo
+    wait: false
+    healthChecks:
+      - apiVersion: apps/v1
+        kind: Deployment
+        name: podinfo
+        namespace: lab-podinfo
+    dependsOn:
+      - name: namespaces
+    postBuild:
+      substitute:
+        CLUSTER_ENV: dev
+        REPLICAS: "2"
+apply:
+  mode: dry-run
+  requires_addons: [flux]
+quiz:
+  - q: "You delete deploy/overlays/dev/hpa.yaml from Git with prune: true. What happens to the HorizontalPodAutoscaler?"
+    options:
+      - "Nothing; prune only acts when the Kustomization is deleted"
+      - "It is deleted on the next reconcile because it left the inventory"
+      - "It is scaled to zero"
+      - "The Kustomization fails with 'object not in source'"
+    answer: 1
+    explain: "Prune compares the new build with status.inventory and deletes what disappeared."
+  - q: "Kustomization app depends on Kustomization db, which has wait: true. db's Deployment is CrashLoopBackOff. What does app do?"
+    options:
+      - "Applies anyway; dependsOn only orders the first run"
+      - "Stays unreconciled with 'dependency not ready' until db's health check passes"
+      - "Applies, then reports db's error in its own status"
+      - "Deletes its inventory"
+    answer: 1
+    explain: "db is not Ready because its health check fails, and dependsOn gates on the Ready condition."
+  - q: "Which object does spec.path refer to?"
+    options:
+      - "A directory relative to the artifact root produced by the source"
+      - "An absolute path inside the kustomize-controller Pod"
+      - "A kustomization.yaml file"
+      - "A URL"
+    answer: 0
+    explain: "The controller untars the source artifact and runs kustomize build on that directory."

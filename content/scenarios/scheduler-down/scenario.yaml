@@ -1,0 +1,50 @@
+id: scheduler-down
+title: "Nothing new gets scheduled"
+realm: scenarios
+category: cluster
+type: troubleshoot
+difficulty: advanced
+estimated_minutes: 20
+tags: [control-plane, scheduler, static-pods, kubeadm]
+requires_addons: []
+summary: "New Pods stay Pending forever with no events at all. Existing workloads are fine. Find the control-plane component that stopped looking."
+brief: |
+  **Ticket #5101 — P1 — nothing new gets scheduled anywhere**
+
+  For about ten minutes every newly created Pod in the cluster has stayed
+  `Pending`. The `api` Deployment in `lab-sched` (3 replicas) is the latest
+  victim: its Pods exist, have no node, and, unusually, `kubectl describe pod`
+  shows **no events at all**, not even `FailedScheduling`.
+
+  Existing Pods keep running and serving. Nodes are Ready, nothing is cordoned,
+  the only taint is the usual control-plane one, and resource requests are
+  tiny. The platform team did a "manifest cleanup" on the control-plane node
+  this morning.
+
+  **Lab note:** nodes are Docker containers here. Where you would `ssh` to the
+  control-plane node, run `docker exec -it sre-labs-control-plane bash`.
+
+  ## Your task
+  - Restore scheduling: the `api` Deployment must reach 3/3 Ready.
+  - The `kube-scheduler` Pod must be back and Ready in `kube-system`.
+  - Repair the control plane; do not hand-assign Pods to nodes or modify the Deployment.
+namespace: lab-sched
+hints:
+  - "A Pending Pod with no FailedScheduling event means no scheduler ever looked at it. Check the component that should have: kubectl get pods -n kube-system -l component=kube-scheduler ; kubectl get lease -n kube-system kube-scheduler -o yaml (look at renewTime)."
+  - "On a kubeadm cluster the control-plane components are static Pods: the kubelet on the control-plane node runs whatever YAML sits in /etc/kubernetes/manifests. No file, no Pod, and no API object to delete. docker exec -it sre-labs-control-plane ls -la /etc/kubernetes/manifests"
+  - "Look for the missing manifest nearby: ls -la /etc/kubernetes/*.bak. A moved file is the easiest to put back; failing that, kubeadm init phase control-plane scheduler --config /kind/kubeadm.conf regenerates a default one."
+  - "Move the manifest back into /etc/kubernetes/manifests/ and watch: the kubelet notices within ~20 s, the scheduler acquires its Lease and drains the Pending queue. kubectl get pods -n lab-sched -w"
+checks:
+  - name: "kube-scheduler static Pod is Ready in kube-system"
+    cmd: kubectl get pod -n kube-system kube-scheduler-sre-labs-control-plane -o jsonpath='{.status.containerStatuses[0].ready}' | grep -qx true
+  - name: "Scheduler manifest is back in /etc/kubernetes/manifests on the control-plane node"
+    cmd: docker exec sre-labs-control-plane test -f /etc/kubernetes/manifests/kube-scheduler.yaml
+  - name: "api Deployment is 3/3 Ready"
+    cmd: test "$(kubectl get deploy -n lab-sched api -o jsonpath='{.status.readyReplicas}')" = "3"
+  - name: "Pods were placed by the scheduler, not by hand (Deployment unmodified, no nodeName in the template)"
+    cmd: test "$(kubectl get deploy -n lab-sched api -o jsonpath='{.metadata.generation}')" = "1" && test -z "$(kubectl get deploy -n lab-sched api -o jsonpath='{.spec.template.spec.nodeName}')"
+concepts:
+  - "kube-scheduler is the only component that sets `spec.nodeName` on Pods. Without it, Pods are still created (ReplicaSet controller) but never placed, and there are no FailedScheduling events because nobody evaluated them (see components/scheduler)."
+  - "kubeadm runs apiserver, controller-manager, scheduler and etcd as static Pods: the control-plane kubelet watches /etc/kubernetes/manifests and creates or removes them as files appear or disappear. The Pods you see in kube-system are read-only mirror Pods."
+  - "Leader election leaves a trail: `kubectl get lease -n kube-system kube-scheduler` shows the holder and the last renewTime. A stale renewTime is the quickest proof that a control-plane component is gone."
+related_lessons: [troubleshooting/cluster-triage]

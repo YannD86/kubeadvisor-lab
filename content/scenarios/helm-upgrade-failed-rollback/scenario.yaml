@@ -1,0 +1,53 @@
+id: helm-upgrade-failed-rollback
+title: "Failed Helm upgrade: roll it back"
+realm: scenarios
+category: helm
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [helm, rollback, history, imagepullbackoff, release]
+requires_addons: []
+summary: "A Helm upgrade of the web release timed out and left a Pod in ImagePullBackOff and the release in status failed. Get the release healthy again with Helm, and leave a trace in its history."
+brief: |
+  **Ticket #5520 — P1 — "web" upgrade failed, pipeline red, Pod in ImagePullBackOff**
+
+  The deploy job for release `web` (namespace `lab-helmcli`, plain Helm, no
+  Flux) ended with `Error: UPGRADE FAILED: context deadline exceeded`. Right now:
+
+      $ helm list -n lab-helmcli
+      NAME  NAMESPACE    REVISION  UPDATED   STATUS  CHART           APP VERSION
+      web   lab-helmcli  2         ...       failed  webchart-0.1.0  1.27
+
+  `kubectl get pods -n lab-helmcli` shows the two previous Pods still serving
+  and a new one stuck in `ImagePullBackOff`. The rollout is frozen half-way:
+  the next node drain takes capacity away with no replacement, and the
+  pipeline refuses to deploy on top of a failed release. The chart source is
+  on the CI runner and may not be available in your terminal.
+
+  ## Your task
+  - Release `web` is in status `deployed` and the live image is `nginx:1.27-alpine` (no `broken` tag anywhere in the release).
+  - The Deployment rollout is complete: 2/2 Pods ready, no Pod in `ImagePullBackOff`.
+  - Do it with Helm (a rollback or a corrected upgrade), so that `helm history` records a new revision; do not patch the Deployment with kubectl.
+namespace: lab-helmcli
+hints:
+  - "Which revision is deployed, which one failed, and what changed between them? helm history web -n lab-helmcli, then helm get values web -n lab-helmcli --revision 2 versus --revision 1."
+  - "Confirm why the new Pod never starts: kubectl describe pod -n lab-helmcli -l app.kubernetes.io/instance=web | grep -A4 Events   (the tag does not exist in the registry)."
+  - "Helm stores the full manifest and values of every revision in the release Secrets: you do not need the chart to go back. helm rollback web 1 -n lab-helmcli --wait"
+  - "Prefer to go forward? helm upgrade web <chart-dir> -n lab-helmcli --set image.tag=1.27-alpine --wait works if you have the chart. Either way helm history must end with a new deployed revision."
+checks:
+  - name: "Helm release web is deployed"
+    cmd: helm status -n lab-helmcli web -o json | grep -q '"status":"deployed"'
+  - name: "Live image is nginx:1.27-alpine (no broken tag)"
+    cmd: test "$(kubectl get deploy -n lab-helmcli web -o jsonpath='{.spec.template.spec.containers[0].image}')" = "nginx:1.27-alpine"
+  - name: "Deployment rollout is complete"
+    cmd: kubectl rollout status -n lab-helmcli deploy/web --timeout=15s
+  - name: "No Pod stuck pulling an image"
+    cmd: test -z "$(kubectl get pods -n lab-helmcli --no-headers 2>/dev/null | grep -E 'ImagePull|ErrImage')"
+  - name: "The fix went through Helm: history has a third revision and the current manifest carries no broken tag"
+    cmd: test "$(helm history -n lab-helmcli web -o json | grep -o '"revision":' | wc -l)" -ge 3 && test -z "$(helm get manifest -n lab-helmcli web | grep broken)"
+concepts:
+  - "A Helm release is a numbered history of (chart + values + rendered manifest) stored as Secrets `sh.helm.release.v1.<name>.v<N>` in the namespace. `helm rollback` re-applies an old revision's manifest as a new revision; it never deletes history. Builder: helm-chart-yaml."
+  - "`helm upgrade --wait` marks the revision `failed` when readiness is not reached in time, but it does not undo anything: the Deployment keeps the broken template. `--atomic` would have rolled back automatically."
+  - "Kubernetes protected you: with RollingUpdate and `maxUnavailable: 25%` on 2 replicas, the old ReplicaSet stays at 2 until a new Pod is Ready, which is why the service was degraded rather than down."
+  - "Fixing the Deployment with `kubectl set image` would leave `helm status` on `failed` and the next `helm upgrade` would diff against Helm's idea of the state, not yours. Repair the release, let the release repair the Deployment."
+related_lessons: [gitops/helm-fundamentals]

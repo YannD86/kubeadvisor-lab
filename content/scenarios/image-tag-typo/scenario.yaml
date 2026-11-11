@@ -1,0 +1,46 @@
+id: image-tag-typo
+title: "Pods stuck in ImagePullBackOff"
+realm: scenarios
+category: config
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [image, ImagePullBackOff, ErrImagePull, registry]
+requires_addons: []
+summary: "A routine nginx version bump in lab-images left the web Deployment with no running Pods. The registry is up and other teams pull from it fine. Work out why these Pods cannot."
+brief: |
+  **Ticket #5133 — P2 — web Pods not starting after image bump**
+
+  The frontend team bumped the nginx version of their `web` Deployment in
+  namespace `lab-images` via the usual pipeline. Since the deploy, the two
+  `web` Pods are not `Running` and the status flips between two values every
+  few minutes. The pipeline re-created the Deployment instead of rolling it,
+  so there are no old Pods left and the service is down.
+
+  The team says "Docker Hub must be having issues", but other namespaces pull
+  the same registry without trouble and the node has internet access.
+
+  ## Your task
+  - Get both `web` Pods `Running` and `1/1 Ready` in namespace `lab-images`.
+  - Use a real, pinned nginx tag (the team policy forbids `latest` and untagged images).
+  - `http://web` must answer HTTP 200 from inside the cluster.
+namespace: lab-images
+hints:
+  - "ErrImagePull / ImagePullBackOff means the container runtime could not fetch the image. `kubectl describe pod -n lab-images <pod>` and read the full `Failed to pull image` event; the registry's answer is in there."
+  - "`not found` / `manifest unknown` is the registry saying the *reference* does not exist, not that it is unreachable. Read the tag in the event letter by letter."
+  - "kubectl get deploy web -n lab-images -o jsonpath='{.spec.template.spec.containers[0].image}' and compare with a tag that exists, e.g. nginx:1.27-alpine."
+  - "kubectl set image deploy/web web=nginx:1.27-alpine -n lab-images triggers a new rollout; the old ReplicaSet is scaled down automatically."
+checks:
+  - name: "Deployment web has 2 ready replicas"
+    cmd: kubectl rollout status -n lab-images deploy/web --timeout=15s >/dev/null && test "$(kubectl get deploy -n lab-images web -o jsonpath='{.status.readyReplicas}')" = "2"
+  - name: "No Pod remains in ErrImagePull / ImagePullBackOff"
+    cmd: for i in 1 2 3 4 5; do test "$(kubectl get pods -n lab-images -l app=web -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' | grep -Ec 'ImagePullBackOff|ErrImagePull')" = "0" && exit 0; sleep 2; done; exit 1
+  - name: "The image is a real pinned nginx tag (no latest, no untagged)"
+    cmd: kubectl get deploy -n lab-images web -o jsonpath='{.spec.template.spec.containers[0].image}' | grep -Eq '^(docker\.io/)?(library/)?nginx:[0-9]'
+  - name: "HTTP 200 from a Pod inside the cluster"
+    cmd: kubectl run -n lab-images probe-$RANDOM --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- -s -o /dev/null -w '%{http_code}' --max-time 5 http://web | grep -q 200
+concepts:
+  - "ErrImagePull is the first failed attempt; ImagePullBackOff is the kubelet backing off (10s, 20s, 40s... up to 5m) before retrying. The status alternates between the two; the cause is the same."
+  - "Read the registry's answer, not the Kubernetes wrapper: `not found` / `manifest unknown` means the tag or repository does not exist; `unauthorized` means credentials (imagePullSecrets); `i/o timeout` means network/proxy."
+  - "Pin tags (`nginx:1.27-alpine`, better a digest) and validate them in CI. `latest` hides which version runs and makes rollbacks a guess."
+related_lessons: [troubleshooting/config-triage]

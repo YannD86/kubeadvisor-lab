@@ -1,0 +1,302 @@
+id: deployment-basics
+title: "Deployment: the anatomy of a workload manifest"
+kind: Deployment
+apiVersion: apps/v1
+realm: manifests
+track: core
+difficulty: beginner
+estimated_minutes: 15
+summary: >
+  Build a Deployment from an empty file and learn the four roots every
+  Kubernetes object shares, then the selector/template contract that makes
+  a Deployment own its Pods.
+intro: |
+  Every Kubernetes object is a document with the same four roots:
+  `apiVersion`, `kind`, `metadata`, `spec`. The API server uses the first two
+  to pick a schema, `metadata` to identify and index the object, and `spec` to
+  learn what you *want*. The controller then writes what *is* into `status`.
+
+  A Deployment adds one idea on top of this: it does not run containers
+  itself. It owns ReplicaSets, which own Pods, and it finds them through a
+  **label selector** that must match the **Pod template** you embed in it.
+  Keep that contract in mind as you type.
+prerequisites: []
+crd: false
+docs_url: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare which API group/version this object belongs to."
+    why: |
+      The API server is a set of versioned REST groups. `apps/v1` is the group
+      that owns Deployments, ReplicaSets, StatefulSets and DaemonSets. Writing
+      the group tells the server which schema to validate you against and which
+      storage version to persist. Core objects like Pod or Service have no group
+      prefix (just `v1`); everything else is `group/version`.
+    hint: "Deployments live in the apps group, stable version v1."
+    expect: { type: equals, value: apps/v1 }
+    reveal: "apiVersion: apps/v1"
+    gotchas:
+      - "`extensions/v1beta1` and `apps/v1beta2` were removed in 1.16; old tutorials still show them."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `kind` selects the resource inside the group. Together with `apiVersion`
+      it forms the GVK (Group-Version-Kind) that every client, controller and
+      admission webhook uses to route your object. It is always CamelCase and
+      singular.
+    hint: "CamelCase, singular."
+    expect: { type: equals, value: Deployment }
+    reveal: "kind: Deployment"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Give the Deployment a name."
+    why: |
+      `metadata` is the identity block shared by every object. `name` must be
+      unique per kind within a namespace and becomes part of the URL
+      (`/apis/apps/v1/namespaces/<ns>/deployments/<name>`). It is also the
+      prefix of every ReplicaSet and Pod the Deployment creates, so keep it
+      short and DNS-safe.
+    hint: "Lowercase DNS label, e.g. web."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: web
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place the Deployment in a namespace."
+    why: |
+      Namespaced objects that omit this field land wherever your kubeconfig
+      context points, which is how production incidents start. Writing the
+      namespace into the manifest makes it reproducible and lets GitOps tools
+      apply it without a `-n` flag.
+    hint: "Explicit beats implicit; write it even if it is default."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+  - path: metadata.labels.app
+    title: "Labels on the Deployment"
+    prompt: "Label the Deployment itself with app: web."
+    why: |
+      Labels are the index of Kubernetes. `kubectl get deploy -l app=web`,
+      cost allocation, network policies and monitoring all key on labels. The
+      Deployment's own labels are *not* what it uses to find Pods (that is the
+      selector) but by convention they mirror the Pod labels so humans can
+      follow the chain.
+    hint: "metadata.labels is a map; the key app is the most common convention."
+    expect: { type: equals, value: web }
+    reveal: |
+      labels:
+        app: web
+  - path: spec.replicas
+    title: "Replicas"
+    prompt: "Ask for 3 Pods."
+    why: |
+      `spec` is the desired state. `replicas` is the first knob: how many Pods
+      the ReplicaSet should keep alive. It defaults to 1 if omitted. When an
+      HPA manages the Deployment, you should *remove* this field from Git,
+      otherwise every GitOps sync fights the autoscaler.
+    hint: "An integer, not a string."
+    expect: { type: integer }
+    reveal: |
+      spec:
+        replicas: 3
+  - path: spec.selector.matchLabels.app
+    title: "Selector"
+    prompt: "Tell the Deployment how to find its Pods: matchLabels app: web."
+    why: |
+      This is the contract. The Deployment owns every ReplicaSet whose Pods
+      match this selector, and the selector is **immutable** after creation.
+      It must be a subset of the Pod template labels, or the API server rejects
+      the object with `selector does not match template labels`.
+    hint: "spec.selector.matchLabels must match spec.template.metadata.labels exactly."
+    expect: { type: equals, value: web }
+    reveal: |
+      selector:
+        matchLabels:
+          app: web
+    gotchas:
+      - "Changing the selector later requires deleting and recreating the Deployment."
+  - path: spec.template.metadata.labels.app
+    title: "Pod template labels"
+    prompt: "Label the Pod template with app: web."
+    why: |
+      `spec.template` is a full PodTemplateSpec: everything below it is what
+      each Pod will look like. Its labels are what the selector matches and
+      what Services select later. If you add labels here you do not have to
+      put them in the selector, but the selector keys must all be present.
+    hint: "Same labels as the selector; this is where Services will look too."
+    expect: { type: equals, value: web }
+    reveal: |
+      template:
+        metadata:
+          labels:
+            app: web
+  - path: spec.template.spec.containers
+    title: "Containers list"
+    prompt: "Open the containers list with one container named web."
+    why: |
+      A Pod is one or more containers that share network and storage.
+      `containers` is a list, each entry needs a unique `name`. The name shows
+      up in `kubectl logs -c`, in events and in metrics, so make it meaningful.
+    hint: "A YAML list of maps; each item needs name and image."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, image] } }
+    reveal: |
+      spec:
+        containers:
+          - name: web
+            image: nginx:1.27-alpine
+  - path: spec.template.spec.containers[0].image
+    title: "Image with a pinned tag"
+    prompt: "Pin the image to an explicit tag."
+    why: |
+      `latest` is not a version, it is a moving target that defeats rollbacks
+      and makes two nodes run different code. Pin a tag (or better, a digest).
+      Image pull policy defaults to `Always` for `latest` and `IfNotPresent`
+      otherwise, which is another reason the tag matters.
+    hint: "Anything but :latest. nginx:1.27-alpine works."
+    expect: { type: regex, value: "^[^:@\\s]+(:[^:@\\s]+|@sha256:[0-9a-f]{64})$" }
+    reveal: "image: nginx:1.27-alpine"
+  - path: spec.template.spec.containers[0].ports[0].containerPort
+    title: "Container port"
+    prompt: "Document the port the container listens on."
+    why: |
+      `containerPort` is informational: it does not open or block anything.
+      But Services with a *named* targetPort, probes that reference a port
+      name, and humans reading the manifest all depend on it. Name the port
+      (`name: http`) so Services can reference `http` instead of a number.
+    hint: "ports is a list; containerPort is an integer. nginx listens on 80."
+    expect: { type: integer }
+    reveal: |
+      ports:
+        - name: http
+          containerPort: 80
+  - path: spec.template.spec.containers[0].resources.requests.cpu
+    title: "Resource requests"
+    prompt: "Request CPU and memory for the container."
+    why: |
+      Requests are what the scheduler uses to place the Pod and what the
+      kubelet uses to set cgroup weights. Without requests the Pod is
+      BestEffort: it is scheduled anywhere and evicted first. With requests but
+      no limits it is Burstable. Requests are the single most important field
+      for cluster stability.
+    hint: "resources.requests.cpu like 100m, resources.requests.memory like 64Mi."
+    expect: { type: regex, value: "^[0-9]+(m|\\.[0-9]+)?$" }
+    reveal: |
+      resources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          memory: 128Mi
+  - path: spec.template.spec.containers[0].resources.limits.memory
+    title: "Memory limit"
+    prompt: "Cap memory so a leak kills one Pod instead of the node."
+    why: |
+      A memory limit becomes the cgroup hard limit; exceeding it triggers an
+      OOMKill of the container, which you will diagnose in a later scenario.
+      CPU limits are debated (they throttle), but memory limits are
+      non-negotiable on shared nodes.
+    hint: "Quantities use Mi/Gi suffixes, e.g. 128Mi."
+    expect: { type: regex, value: "^[0-9]+(Mi|Gi|M|G|Ki)$" }
+    reveal: |
+      limits:
+        memory: 128Mi
+  - path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+    title: "Readiness probe"
+    prompt: "Add an HTTP readiness probe on / port http."
+    why: |
+      Readiness decides whether the Pod receives Service traffic. Without it a
+      Pod is marked Ready the instant its process starts, and rolling updates
+      send traffic to containers still booting. Readiness is also what
+      `maxUnavailable` counts during a rollout.
+    hint: "readinessProbe.httpGet needs path and port; port can be the name http."
+    expect: { type: regex, value: "^/.*" }
+    reveal: |
+      readinessProbe:
+        httpGet:
+          path: /
+          port: http
+        initialDelaySeconds: 2
+        periodSeconds: 5
+  - path: spec.strategy.rollingUpdate.maxUnavailable
+    title: "Rollout strategy"
+    prompt: "Make rollouts zero-downtime: maxUnavailable 0, maxSurge 1."
+    why: |
+      `strategy` controls how the Deployment replaces old Pods. The default
+      (25% / 25%) can take down a quarter of a small service. `maxUnavailable: 0`
+      with `maxSurge: 1` means a new Pod must be Ready before an old one is
+      removed, which is only meaningful because you added a readiness probe.
+    hint: "spec.strategy.rollingUpdate has maxUnavailable and maxSurge; 0 and 1 are integers."
+    expect: { type: integer }
+    reveal: |
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 0
+          maxSurge: 1
+final_manifest: |
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: web
+    namespace: lab-build
+    labels:
+      app: web
+  spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app: web
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 1
+    template:
+      metadata:
+        labels:
+          app: web
+      spec:
+        containers:
+          - name: web
+            image: nginx:1.27-alpine
+            ports:
+              - name: http
+                containerPort: 80
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                memory: 128Mi
+            readinessProbe:
+              httpGet:
+                path: /
+                port: http
+              initialDelaySeconds: 2
+              periodSeconds: 5
+apply:
+  mode: create
+  requires_addons: []
+quiz:
+  - q: "You change spec.selector.matchLabels on an existing Deployment and apply. What happens?"
+    options:
+      - "Pods are relabelled in place"
+      - "The API server rejects the update: the selector is immutable"
+      - "A new ReplicaSet is created and old Pods are orphaned"
+      - "Nothing until the next rollout"
+    answer: 1
+    explain: "Deployment selectors are immutable in apps/v1; you must delete and recreate."
+  - q: "Which field does a Service use to find Pods created by this Deployment?"
+    options:
+      - "spec.selector of the Deployment"
+      - "metadata.labels of the Deployment"
+      - "spec.template.metadata.labels (the Pod labels)"
+      - "metadata.name"
+    answer: 2
+    explain: "Services select Pods by Pod labels; the Deployment's own labels are irrelevant to it."
+  - q: "What QoS class does a Pod get with requests set and no limits?"
+    options: ["Guaranteed", "Burstable", "BestEffort", "Unbounded"]
+    answer: 1
+    explain: "Requests without equal limits means Burstable; nothing set means BestEffort."

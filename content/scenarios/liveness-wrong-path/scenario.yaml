@@ -1,0 +1,47 @@
+id: liveness-wrong-path
+title: "Healthy app restarted every few seconds"
+realm: scenarios
+category: config
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [probes, liveness, CrashLoopBackOff, restarts]
+requires_addons: []
+summary: "The web Pods in lab-probes serve pages fine for a few seconds, then get killed, over and over. Restart counts climb and the Pods end up in CrashLoopBackOff. Nothing in the app logs explains it."
+brief: |
+  **Ticket #5148 — P2 — web keeps restarting, intermittent 503s**
+
+  Since the "add health checks" change shipped this morning, the `web`
+  Deployment in namespace `lab-probes` is unstable. Users see intermittent
+  errors; `kubectl get pods` shows the restart counter climbing on both Pods
+  and, after a while, `CrashLoopBackOff`.
+
+  The developers checked `kubectl logs`: nginx starts cleanly, serves a few
+  requests, and then the log just ends. No error, no stack trace, no OOM
+  message. They are convinced "the node is killing our Pods".
+
+  ## Your task
+  - Both `web` Pods `Running`, `1/1 Ready` and no longer restarting in namespace `lab-probes`.
+  - Keep a liveness probe on the container (platform policy); make it one that actually reflects the health of nginx.
+namespace: lab-probes
+hints:
+  - "A process that stops without an error in its own logs was stopped by someone else. `kubectl describe pod -n lab-probes <pod>`: look at `Last State`, the exit code, and the Events."
+  - "kubectl logs -n lab-probes <pod> --previous shows the log of the killed instance. Look at the access log lines right before the end: which path was requested and what status code did nginx return?"
+  - "Events say `Liveness probe failed: HTTP probe failed with statuscode: 404`. Compare the probe path in the Deployment with the paths nginx actually serves."
+  - "Fix the probe, not the policy: kubectl edit deploy web -n lab-probes and point livenessProbe.httpGet.path to `/` (or add a `/health` location through a ConfigMap-mounted nginx.conf)."
+checks:
+  - name: "Deployment web has 2 ready replicas"
+    cmd: kubectl rollout status -n lab-probes deploy/web --timeout=15s >/dev/null && test "$(kubectl get deploy -n lab-probes web -o jsonpath='{.status.readyReplicas}')" = "2"
+  - name: "A liveness probe is still defined (do not just delete it)"
+    cmd: test -n "$(kubectl get deploy -n lab-probes web -o jsonpath='{.spec.template.spec.containers[0].livenessProbe}')"
+  - name: "The liveness endpoint answers 2xx inside the container"
+    cmd: p=$(kubectl get deploy -n lab-probes web -o jsonpath='{.spec.template.spec.containers[0].livenessProbe.httpGet.path}'); kubectl exec -n lab-probes deploy/web -- wget -q -O /dev/null "http://127.0.0.1:80${p:-/}"
+  - name: "No Pod is in CrashLoopBackOff"
+    cmd: test "$(kubectl get pods -n lab-probes -l app=web -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' | grep -c CrashLoopBackOff)" = "0"
+  - name: "Restart counts stop increasing (observed over 15s)"
+    cmd: a=$(kubectl get pods -n lab-probes -l app=web -o jsonpath='{range .items[*]}{.metadata.name}={.status.containerStatuses[0].restartCount} {end}'); sleep 15; b=$(kubectl get pods -n lab-probes -l app=web -o jsonpath='{range .items[*]}{.metadata.name}={.status.containerStatuses[0].restartCount} {end}'); test -n "$a" && test "$a" = "$b"
+concepts:
+  - "A failed liveness probe makes the kubelet kill the container (SIGTERM, then SIGKILL) and restart it; the app sees nothing wrong and logs nothing. `describe` Events and `Last State` are where the evidence lives, `kubectl logs --previous` shows what the killed instance saw."
+  - "CrashLoopBackOff is not a cause, it is the kubelet backing off (10s, 20s... up to 5m) between restarts, whatever killed the container (exit code, OOM, or a probe)."
+  - "Liveness answers 'should this process be restarted?'; readiness answers 'should it receive traffic?'. A liveness probe pointing at a non-existent path turns a healthy Deployment into a restart loop; probe an endpoint the server really serves."
+related_lessons: [troubleshooting/config-triage]

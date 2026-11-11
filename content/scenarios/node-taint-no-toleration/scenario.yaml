@@ -1,0 +1,50 @@
+id: node-taint-no-toleration
+title: "Ingest workers never land on the SSD node"
+realm: scenarios
+category: node
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [scheduling, taints, tolerations, nodeselector]
+requires_addons: []
+summary: "A Deployment pinned to the SSD node stays Pending although that node is Ready and nearly empty. Make the Pods welcome without breaking the node's reservation."
+brief: |
+  **Ticket #5041 — P2 — ingest workers never start on the SSD node**
+
+  The data pipeline team deployed `ingest` in `lab-taint`. Its Pods must run on
+  the SSD-backed node (`sre-labs-worker2`, labelled `disk=ssd`) because they
+  write to local scratch space. Both replicas have been `Pending` for an hour.
+
+  The node is Ready, not cordoned, and has plenty of room. Last month the data
+  team had the platform team **reserve** that node for their workloads; that
+  reservation is still wanted and other teams' Pods must keep landing
+  elsewhere.
+
+  ## Your task
+  - Both `ingest` Pods must be Running on `sre-labs-worker2`.
+  - The node's reservation and its `disk=ssd` label must stay exactly as they are.
+  - Keep the `nodeSelector` on the Deployment; the Pods really need that node.
+namespace: lab-taint
+hints:
+  - "kubectl describe pod -n lab-taint -l app=ingest | grep -A6 Events   The FailedScheduling line gives one reason per node; find the one about sre-labs-worker2."
+  - "kubectl describe node sre-labs-worker2 | grep -A2 -i taints   A NoSchedule taint repels every Pod that does not explicitly tolerate it, even Pods whose nodeSelector points at that node."
+  - "Taints and tolerations are a handshake. The node says 'only Pods that tolerate team=data may come'; the Pod must answer with a matching toleration. Removing the taint would give everyone access and break the reservation."
+  - >-
+    Add to the Pod template (kubectl edit deploy ingest -n lab-taint):
+    tolerations: [{key: team, operator: Equal, value: data, effect: NoSchedule}]
+    then watch the Pods land: kubectl get pods -n lab-taint -o wide -w
+checks:
+  - name: "Taint team=data:NoSchedule still present on sre-labs-worker2 (reservation kept)"
+    cmd: test "$(kubectl get node sre-labs-worker2 -o jsonpath='{.spec.taints[?(@.key=="team")].value}')" = "data" && kubectl get node sre-labs-worker2 -o jsonpath='{.spec.taints[?(@.key=="team")].effect}' | grep -q NoSchedule
+  - name: "Label disk=ssd still on sre-labs-worker2"
+    cmd: test "$(kubectl get node sre-labs-worker2 -o jsonpath='{.metadata.labels.disk}')" = "ssd"
+  - name: "Deployment keeps its nodeSelector disk=ssd"
+    cmd: test "$(kubectl get deploy -n lab-taint ingest -o jsonpath='{.spec.template.spec.nodeSelector.disk}')" = "ssd"
+  - name: "Both ingest Pods are Ready and running on sre-labs-worker2"
+    cmd: test "$(kubectl get deploy -n lab-taint ingest -o jsonpath='{.status.readyReplicas}')" = "2" && test "$(kubectl get pods -n lab-taint -l app=ingest --field-selector=status.phase=Running -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | grep -cx sre-labs-worker2)" = "2"
+concepts:
+  - "Taints live on Nodes, tolerations on Pods. A NoSchedule taint rejects Pods without a matching toleration at scheduling time; NoExecute additionally evicts running ones."
+  - "nodeSelector and affinity *attract* Pods to nodes; taints *repel* them. To land on a reserved node a Pod needs both: a selector that targets it and a toleration that lets it in."
+  - "Read FailedScheduling as a per-node verdict: `1 node(s) had untolerated taint {team: data}` tells you exactly which key, value and effect to tolerate (see components/scheduler)."
+  - "Never fix a scheduling problem by removing someone else's taint: the taint is the contract that keeps the node reserved for its owners."
+related_lessons: [troubleshooting/node-triage]

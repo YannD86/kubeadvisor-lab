@@ -1,0 +1,48 @@
+id: pod-dns-config-broken
+title: "One app cannot resolve, everything else can"
+realm: scenarios
+category: network
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [dns, dnspolicy, dnsconfig, resolv.conf]
+requires_addons: []
+summary: "The orders app logs 'Could not resolve host: backend' while its neighbours resolve the same name fine. Find what makes this workload different."
+brief: |
+  **Ticket #5017 — P2 — orders app cannot find the backend, everything else can**
+
+  The `app` Deployment in `lab-dnspolicy` logs
+  `curl: (6) Could not resolve host: backend` continuously since its last
+  deploy. The `backend` Service exists and has endpoints. The `reporting`
+  Deployment in the same namespace calls `http://backend` every few seconds and
+  gets `200`, and so does a throwaway busybox Pod.
+
+  The orders team says the last deploy was a "performance tuning" change that
+  did not touch application code. CoreDNS is healthy and no other team is
+  affected.
+
+  ## Your task
+  - `app` Pods must resolve and reach `http://backend` (HTTP 200) using the Service name.
+  - The fix must live in the `app` Deployment's Pod template and be fully rolled
+    out (no Pods from the old template left).
+  - Do not touch CoreDNS, the `backend` Service or the `reporting` Deployment.
+namespace: lab-dnspolicy
+hints:
+  - "One workload failing DNS while its neighbours succeed points at that Pod's own resolver settings, not at CoreDNS. Compare the two: kubectl exec -n lab-dnspolicy deploy/app -- cat /etc/resolv.conf   versus   kubectl exec -n lab-dnspolicy deploy/reporting -- cat /etc/resolv.conf"
+  - "A Pod's /etc/resolv.conf is written by the kubelet from spec.dnsPolicy and spec.dnsConfig: kubectl get deploy app -n lab-dnspolicy -o yaml | grep -B2 -A10 dnsPolicy"
+  - "dnsPolicy: None means 'ignore the cluster DNS and use exactly what dnsConfig says'. Is that nameserver the kube-dns ClusterIP? kubectl get svc -n kube-system kube-dns"
+  - "Fix: set dnsPolicy: ClusterFirst and remove the dnsConfig block (or point dnsConfig.nameservers at the kube-dns ClusterIP and keep the cluster search list), then kubectl rollout status deploy/app -n lab-dnspolicy"
+checks:
+  - name: "app rollout is complete (no Pods left from the broken template)"
+    cmd: kubectl rollout status -n lab-dnspolicy deploy/app --timeout=15s >/dev/null
+  - name: "app Pods use the cluster DNS server (kube-dns ClusterIP in resolv.conf)"
+    cmd: kubectl exec -n lab-dnspolicy deploy/app -- cat /etc/resolv.conf | grep -q "nameserver $(kubectl get svc -n kube-system kube-dns -o jsonpath='{.spec.clusterIP}')"
+  - name: "app Pod gets HTTP 200 from http://backend by name"
+    cmd: kubectl exec -n lab-dnspolicy deploy/app -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://backend | grep -q 200
+  - name: "backend and reporting were not modified"
+    cmd: test "$(kubectl get deploy -n lab-dnspolicy backend -o jsonpath='{.metadata.generation}')" = "1" && test "$(kubectl get deploy -n lab-dnspolicy reporting -o jsonpath='{.metadata.generation}')" = "1"
+concepts:
+  - "The kubelet writes each Pod's /etc/resolv.conf according to dnsPolicy: ClusterFirst (the default) uses the kube-dns ClusterIP plus the cluster search list; Default copies the node's resolver; None uses exactly what dnsConfig provides."
+  - "`dnsPolicy: None` with `dnsConfig` is a legitimate tool (corporate resolvers, ndots tuning) but it is also the easiest way to silently detach one workload from cluster DNS."
+  - "Scope first: a DNS failure confined to one workload is almost never a CoreDNS problem. Compare the failing Pod with a healthy neighbour before touching kube-system (see components/cni-and-coredns for how resolution flows)."
+related_lessons: [troubleshooting/network-triage]

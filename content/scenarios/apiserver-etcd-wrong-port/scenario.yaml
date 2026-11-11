@@ -1,0 +1,56 @@
+id: apiserver-etcd-wrong-port
+title: "Control plane down: kubectl cannot connect"
+realm: scenarios
+category: cluster
+type: troubleshoot
+difficulty: advanced
+estimated_minutes: 25
+tags: [control-plane, kube-apiserver, etcd, static-pods, crictl]
+requires_addons: []
+summary: "Every kubectl command is refused and the dashboards are blank, while running workloads keep serving. Work from the control-plane node with crictl to find out why the API server will not come up."
+brief: |
+  **Ticket #5120 — P1 — control plane down: kubectl cannot connect**
+
+  Every `kubectl` command fails with
+  `The connection to the server 127.0.0.1:<port> was refused - did you specify the right host or port?`
+  Dashboards are blank, CI deploys fail, Flux is blind. Workloads that were
+  already running still serve traffic (the data plane does not need the API
+  to keep running), but nothing can be inspected or changed.
+
+  The platform team was "hardening etcd" on the control-plane node this
+  morning and has since left for lunch.
+
+  **Read before you start: `kubectl` will not help you here.** The API server
+  is the thing that is broken, and in this lab you have the same access an SRE
+  has to a kubeadm control-plane node:
+
+  - `docker exec -it sre-labs-control-plane bash` (on a real cluster: `ssh` to the control-plane node)
+  - `crictl ps -a` lists the control-plane containers, including exited ones; `crictl logs <id>` shows their output
+  - `/etc/kubernetes/manifests/` holds the static Pod manifests the kubelet runs
+  - `journalctl -u kubelet` shows what the kubelet thinks of them
+
+  ## Your task
+  - `kubectl get --raw /readyz` must return `ok` from your terminal.
+  - The `kube-apiserver` static Pod must be Running and Ready in `kube-system`.
+  - Fix the API server's configuration; do not modify etcd or its manifest.
+namespace: kube-system
+hints:
+  - "The kubelet on the control-plane node keeps restarting the API server from its manifest. See what it does: docker exec -it sre-labs-control-plane bash, then crictl ps -a | grep kube-apiserver. A container that keeps appearing as Exited is a crash loop."
+  - "Read the last attempt's output: crictl logs --tail 30 <container-id of the latest kube-apiserver>. Look for what it is failing to connect to, and on which port."
+  - "The API server's flags live in /etc/kubernetes/manifests/kube-apiserver.yaml. Compare its --etcd-servers flag with where etcd actually listens: grep -- --listen-client-urls /etc/kubernetes/manifests/etcd.yaml"
+  - "Fix the flag in the manifest (sed -i or vi). The kubelet notices the change within ~20 s and restarts the Pod. Then from your terminal: kubectl get --raw /readyz and kubectl -n kube-system get pods"
+checks:
+  - name: "API server answers /readyz with ok"
+    cmd: kubectl get --raw /readyz --request-timeout=10s | grep -q '^ok'
+  - name: "kube-apiserver manifest points at etcd on port 2379"
+    cmd: docker exec sre-labs-control-plane grep -q -- '--etcd-servers=https://127.0.0.1:2379' /etc/kubernetes/manifests/kube-apiserver.yaml
+  - name: "etcd manifest was not modified (still listening on 2379)"
+    cmd: docker exec sre-labs-control-plane grep -q -- 'listen-client-urls=https://127.0.0.1:2379' /etc/kubernetes/manifests/etcd.yaml
+  - name: "kube-apiserver static Pod is Ready in kube-system"
+    cmd: kubectl get pod -n kube-system kube-apiserver-sre-labs-control-plane -o jsonpath='{.status.containerStatuses[0].ready}' | grep -qx true
+concepts:
+  - "kube-apiserver is stateless; etcd is the state. Without an etcd connection the API server refuses to start, and every client (kubectl, controllers, kubelets, Flux) loses the cluster at once while running containers carry on (see components/kube-apiserver)."
+  - "On a kubeadm control plane you debug *below* the API: crictl for containers, /etc/kubernetes/manifests for configuration, journalctl -u kubelet for the static Pod lifecycle. Learn these commands before you need them at 3 a.m."
+  - "Static Pod edits are live: the kubelet hashes the manifest and restarts the Pod on any change. That is both the failure mechanism here and the repair mechanism."
+  - "Verify readiness, not just a process: /readyz aggregates etcd connectivity and the other startup checks; /livez and /healthz are weaker signals."
+related_lessons: [troubleshooting/cluster-triage]

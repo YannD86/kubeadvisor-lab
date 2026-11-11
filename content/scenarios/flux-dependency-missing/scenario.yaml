@@ -1,0 +1,58 @@
+id: flux-dependency-missing
+title: "Kustomization blocked on a missing dependency"
+realm: scenarios
+category: gitops
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [flux, kustomization, dependsOn, ordering, gitops]
+requires_addons: [gitea, flux]
+summary: "The app Kustomization has waited an hour for a dependency that Flux cannot find. The repository has an infra layer; nothing reconciles it. Make the chain whole without dropping the dependency."
+brief: |
+  **Ticket #5304 — P2 — podinfo "app" Kustomization stuck on a dependency**
+
+  The podinfo team split repository `flux-dependency-missing` into two layers:
+  `infra/` (the application namespace and a ConfigMap the app reads its
+  settings from) and `app/` (Deployment + Service). In namespace `lab-dep`
+  the GitRepository `platform` is Ready and the Kustomization `app` declares
+  `dependsOn: [{name: infra}]` so that the ConfigMap exists before the Pods
+  start.
+
+  `app` has been red for an hour:
+
+      $ flux get kustomizations -n lab-dep
+      NAME   REVISION   SUSPENDED   READY   MESSAGE
+      app               False       False   dependency 'lab-dep/infra' not found: kustomizations.kustomize.toolkit.fluxcd.io "infra" not found
+
+  The team says "we applied the infra layer last week, it must be there", and
+  they refuse to drop the dependency: without the ConfigMap and the namespace
+  from `infra/` the app cannot start at all. Namespace `lab-dep-app` does not exist.
+
+  ## Your task
+  - A Kustomization named `infra` in `lab-dep` reconciles `./infra` from the existing GitRepository `platform` and is `Ready=True`.
+  - The `app` Kustomization keeps its `dependsOn` on `infra` and becomes `Ready=True`.
+  - ConfigMap `podinfo-config` in `lab-dep-app` was created by Flux (owned by the `infra` Kustomization).
+  - Deployment `podinfo` in `lab-dep-app` is available.
+namespace: lab-dep
+hints:
+  - "dependsOn is a reference by name, in the same namespace unless .namespace is set. Compare the name app waits for with what exists: kubectl get kustomizations -n lab-dep"
+  - "The repository has an ./infra directory with its own kustomization.yaml and nobody applies it. Draft the missing object: flux create kustomization infra -n lab-dep --source=GitRepository/platform --path=./infra --prune=true --wait=true --interval=1m --export"
+  - "Apply it in lab-dep and watch: flux get kustomizations -n lab-dep --watch. app re-evaluates its dependencies every 30s; flux reconcile kustomization app -n lab-dep makes it check right away."
+  - "Do not remove dependsOn: the Deployment lives in a namespace and reads a ConfigMap that only ./infra creates, so app would fail differently instead of succeeding."
+checks:
+  - name: "Kustomization infra exists in lab-dep and is Ready"
+    cmd: test "$(kubectl get kustomization -n lab-dep infra -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True"
+  - name: "Kustomization app is Ready"
+    cmd: test "$(kubectl get kustomization -n lab-dep app -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = "True"
+  - name: "app still depends on infra (the dependency was satisfied, not removed)"
+    cmd: kubectl get kustomization -n lab-dep app -o jsonpath='{.spec.dependsOn[*].name}' | grep -qw infra
+  - name: "ConfigMap podinfo-config in lab-dep-app is owned by the infra Kustomization"
+    cmd: test "$(kubectl get configmap -n lab-dep-app podinfo-config -o jsonpath='{.metadata.labels.kustomize\.toolkit\.fluxcd\.io/name}')" = "infra"
+  - name: "Deployment podinfo in lab-dep-app is available"
+    cmd: test "$(kubectl get deploy -n lab-dep-app podinfo -o jsonpath='{.status.availableReplicas}')" -ge 1
+concepts:
+  - "`spec.dependsOn` orders Kustomizations: the dependent is not applied until every dependency exists, is Ready at its current generation and (when they share a source) has applied the same revision. Builder: flux-kustomization."
+  - "A missing dependency is reported as `DependencyNotReady` / `dependency '<ns>/<name>' not found` and re-checked every 30s (`--requeue-dependency`): Flux does not fail, it waits, which is why such a Kustomization can stay red for hours without an error event."
+  - "Splitting a repository into layers (namespaces, CRDs and config first; workloads second) is the standard way to avoid ordering races; each layer needs its own Kustomization, and the dependency graph is only as good as the objects that actually exist."
+  - "Removing a dependsOn to 'unblock' a Kustomization moves the failure instead of fixing it: here the Deployment would be rejected because its namespace does not exist."
+related_lessons: [gitops/flux-architecture]

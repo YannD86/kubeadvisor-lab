@@ -1,0 +1,47 @@
+id: configmap-mount-wrong-key
+title: "Pods stuck in ContainerCreating"
+realm: scenarios
+category: config
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 12
+tags: [configmap, volume, items, ContainerCreating, FailedMount]
+requires_addons: []
+summary: "The status page in lab-mount never comes up: its Pods have been ContainerCreating for ages and the Service has no endpoints. The image is cached on every node. Find what the kubelet is waiting for."
+brief: |
+  **Ticket #5194 — P3 — status page Pods stuck in ContainerCreating**
+
+  The `web` Deployment in namespace `lab-mount` serves a static status page
+  whose HTML lives in the `web-content` ConfigMap, mounted into nginx's
+  document root. After the last change (the author "only tidied up the
+  volume definition") both Pods have been in `ContainerCreating` for over
+  ten minutes. `kubectl logs` says the container has not started.
+
+  The nginx image is already present on all three nodes, the ConfigMap is
+  there with the page in it, and other nginx Pods in the cluster start in
+  seconds.
+
+  ## Your task
+  - Both `web` Pods `Running` and `1/1 Ready` in namespace `lab-mount`.
+  - `http://web` returns the custom status page from the `web-content` ConfigMap (the response contains `all systems nominal`).
+  - Keep serving the page from the ConfigMap volume; do not replace it with another mechanism.
+namespace: lab-mount
+hints:
+  - "ContainerCreating for more than a minute is almost always a volume. kubectl describe pod -n lab-mount <pod> and read the Events: look for FailedMount / MountVolume.SetUp."
+  - "The event says `configmap references non-existent config key`. A ConfigMap volume with `items:` projects specific keys; each `key:` must exist in the ConfigMap's data."
+  - "kubectl get cm web-content -n lab-mount -o jsonpath='{.data}' | head -c 200 lists the real keys; compare with volumes[].configMap.items[].key in the Deployment."
+  - "Fix the key in the Deployment (kubectl edit deploy web -n lab-mount), keep path: index.html. Alternatively add the missing key to the ConfigMap, but you would carry two copies of the page."
+checks:
+  - name: "Deployment web has 2 ready replicas"
+    cmd: kubectl rollout status -n lab-mount deploy/web --timeout=15s >/dev/null && test "$(kubectl get deploy -n lab-mount web -o jsonpath='{.status.readyReplicas}')" = "2"
+  - name: "No Pod is stuck in ContainerCreating"
+    cmd: for i in 1 2 3 4 5; do test "$(kubectl get pods -n lab-mount -l app=web -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' | grep -c ContainerCreating)" = "0" && exit 0; sleep 2; done; exit 1
+  - name: "The page is still served from the web-content ConfigMap volume"
+    cmd: kubectl get deploy -n lab-mount web -o jsonpath='{.spec.template.spec.volumes[*].configMap.name}' | grep -qw web-content && kubectl get cm -n lab-mount web-content >/dev/null
+  - name: "http://web returns the custom status page"
+    cmd: kubectl run -n lab-mount probe-$RANDOM --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- -s --max-time 5 http://web | grep -q 'all systems nominal'
+concepts:
+  - "ContainerCreating is the kubelet preparing the sandbox: pulling the image, setting up networking and *mounting volumes*. A volume that cannot be set up keeps the Pod there indefinitely; the reason is a FailedMount event, never a log line."
+  - "A ConfigMap volume with `items:` is a projection: every `key:` must exist in `data` (or `binaryData`) or the mount fails. Without `items:` every key becomes a file and a missing key cannot happen."
+  - "Mounting over /usr/share/nginx/html replaces the whole directory with the projected files; whatever is not in the ConfigMap is gone, including the default index.html."
+related_lessons: [troubleshooting/config-triage]

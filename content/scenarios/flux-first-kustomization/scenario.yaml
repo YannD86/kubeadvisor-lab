@@ -1,0 +1,58 @@
+id: flux-first-kustomization
+title: "Your first Flux Kustomization"
+realm: scenarios
+category: gitops
+type: build
+difficulty: beginner
+estimated_minutes: 15
+tags: [flux, gitrepository, kustomization, gitops, source-controller]
+requires_addons: [gitea, flux]
+summary: "The podinfo manifests sit in a Git repository and nobody is allowed to kubectl apply them. Wire the repository to the cluster with a GitRepository and a Kustomization so that Git, not a human, deploys the app."
+brief: |
+  **Build brief — onboard `podinfo` to GitOps**
+
+  The platform team pushed the manifests for `podinfo` to the local Git server,
+  repository `flux-first-kustomization`, under `deploy/podinfo/`: a Namespace
+  (`lab-podinfo`), a Deployment (2 replicas of `ghcr.io/stefanprodan/podinfo:6.7.1`),
+  a Service and a `kustomization.yaml` listing the three. Nothing is deployed
+  yet, and the rule of the house is that nobody runs `kubectl apply` on these
+  files: the cluster must pull them from Git and keep them in sync.
+
+  Flux is installed in `flux-system`. The namespace `lab-flux1` exists and is
+  yours for the Flux objects. From inside the cluster the repository is
+  reachable at:
+
+      http://gitea.lab-gitea.svc.cluster.local:3000/lab/flux-first-kustomization.git
+
+  From your terminal you can browse it at `http://localhost:30080/lab/flux-first-kustomization`
+  (user `lab`, password `labpass123`).
+
+  ## Your task
+  - In `lab-flux1`, create a `GitRepository` that tracks branch `main` and polls it every `30s`.
+  - In `lab-flux1`, create a `Kustomization` that applies `./deploy/podinfo` from that source, with `prune` and `wait` enabled.
+  - Both objects report `Ready=True`.
+  - Deployment `podinfo` in `lab-podinfo` is available and Service `podinfo` exists.
+  - They carry Flux's ownership labels: they came through the Kustomization, not through `kubectl apply`.
+namespace: lab-flux1
+hints:
+  - "Two objects, two controllers: source-controller turns a Git ref into an artifact (GitRepository); kustomize-controller applies one path of that artifact (Kustomization). Create both in lab-flux1, not in flux-system."
+  - "Let the CLI write the YAML for you: flux create source git podinfo -n lab-flux1 --url=http://gitea.lab-gitea.svc.cluster.local:3000/lab/flux-first-kustomization.git --branch=main --interval=30s --export"
+  - "Then: flux create kustomization podinfo -n lab-flux1 --source=GitRepository/podinfo --path=./deploy/podinfo --prune=true --wait=true --interval=1m --export   and pipe each one into kubectl apply -f -"
+  - "Not Ready? flux get sources git -n lab-flux1 and flux get kustomizations -n lab-flux1 print the controller's message; kubectl describe kustomization podinfo -n lab-flux1 shows the events."
+checks:
+  - name: "A GitRepository in lab-flux1 is Ready, tracks branch main and polls every 30s"
+    cmd: kubectl get gitrepository -n lab-flux1 -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}/{.spec.ref.branch}/{.spec.interval}{"\n"}{end}' | grep -qx 'True/main/30s'
+  - name: "A Kustomization in lab-flux1 is Ready, applies ./deploy/podinfo, with prune and wait enabled"
+    cmd: kubectl get kustomization -n lab-flux1 -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}/{.spec.path}/{.spec.prune}/{.spec.wait}{"\n"}{end}' | grep -qxE 'True/(\./)?deploy/podinfo/?/true/true'
+  - name: "Deployment podinfo in lab-podinfo is available"
+    cmd: test "$(kubectl get deploy -n lab-podinfo podinfo -o jsonpath='{.status.availableReplicas}')" -ge 1
+  - name: "Service podinfo exists in lab-podinfo"
+    cmd: kubectl get svc -n lab-podinfo podinfo -o name
+  - name: "The Deployment came through Flux (kustomize-controller ownership labels), not kubectl apply"
+    cmd: test -n "$(kubectl get deploy -n lab-podinfo podinfo -o jsonpath='{.metadata.labels.kustomize\.toolkit\.fluxcd\.io/name}')"
+concepts:
+  - "source-controller fetches Git and publishes a versioned tarball, the *artifact* (revision `main@sha1:...`). kustomize-controller never talks to Git: it only consumes artifacts. Builders: flux-gitrepository, flux-kustomization."
+  - "`prune: true` lets Flux garbage-collect objects that disappear from Git; `wait: true` makes Ready mean 'applied and healthy' instead of 'applied'. Without them a Kustomization is a one-way fire-and-forget apply."
+  - "Flux labels everything it applies with `kustomize.toolkit.fluxcd.io/name` and `/namespace`: that is how it knows what it owns, what to prune, and how you tell a GitOps-managed object from a hand-applied one."
+  - "A Kustomization can live in any namespace; `spec.sourceRef` defaults to the same namespace. Cross-namespace references need `sourceRef.namespace` and can be disabled cluster-wide with `--no-cross-namespace-refs`."
+related_lessons: [gitops/flux-architecture]

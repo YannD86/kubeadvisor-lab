@@ -1,0 +1,127 @@
+realms:
+  - id: manifests
+    title: "Manifest Nomenclature & CRDs"
+    tagline: "Build every manifest from a blank editor, one field at a time, and learn why each line exists."
+    icon: braces
+    color: violet
+    kind: builders
+    order: 1
+    access: free
+    description: |
+      Core objects first (Deployment, Service, ConfigMap), then the grammar of
+      CustomResourceDefinitions, then the CRDs you meet daily as an SRE: Flux,
+      Helm releases, cert-manager, Gateway API, Prometheus Operator, External
+      Secrets. Each activity is a guided build with hints on highlight and a
+      "why" for every field.
+  - id: gitops
+    title: "GitOps Flow: Flux CD & Helm"
+    tagline: "From a Git commit to a running release: sources, kustomizations, Helm charts and the controllers that reconcile them."
+    icon: git-branch
+    color: sky
+    kind: lessons
+    order: 2
+    access: free
+    description: |
+      Lessons on the Flux toolkit (source, kustomize, helm, notification and
+      image-automation controllers), Helm charts, values and templating, with
+      practice labs on a local Gitea + Flux installation in your kind cluster.
+  - id: components
+    title: "Kubernetes Components Realm"
+    tagline: "Control plane and node anatomy: what each component does, how they talk, and how to inspect them live."
+    icon: cpu
+    color: emerald
+    kind: lessons
+    order: 3
+    access: free
+    description: |
+      kube-apiserver, etcd, scheduler, controller-manager, kubelet, kube-proxy,
+      container runtime, CNI, CoreDNS, and the HPA control loop with
+      metrics-server. Interactive anatomy diagram, request lifecycle
+      walk-through, and inspection labs on real kind nodes.
+  - id: scenarios
+    title: "Loaded Scenarios"
+    tagline: "A broken cluster, a terminal, k9s, and a checker. Fix it like it is 3 a.m."
+    icon: terminal
+    color: amber
+    kind: scenarios
+    order: 4
+    access: pro
+    description: |
+      Scenario catalog across node, cluster, network, config, storage, RBAC and
+      GitOps failures. Each scenario loads a real fault into your kind cluster,
+      gives you a web terminal with kubectl, helm, flux and k9s, progressive
+      hints, automated checks and a full solution.
+  - id: troubleshooting
+    title: "Concepts & Troubleshooting Method"
+    tagline: "The mental models behind the fixes: how to triage node, cluster, network and config failures systematically."
+    icon: stethoscope
+    color: rose
+    kind: lessons
+    order: 5
+    access: free
+    description: |
+      A troubleshooting method (observe → hypothesise → test → fix → prevent),
+      then a chapter per failure domain with the signals, the commands and the
+      scenarios where you practice them.
+
+tracks:                       # builder grouping
+  - id: core
+    title: "Core objects"
+  - id: crd
+    title: "CRD grammar"
+  - id: flux
+    title: "Flux CD"
+  - id: helm
+    title: "Helm"
+  - id: networking
+    title: "Networking"
+  - id: observability
+    title: "Observability"
+  - id: security
+    title: "Security & secrets"
+
+categories:                   # scenario categories
+  - id: config
+    title: "Config issues"
+    description: "ConfigMaps, Secrets, env, probes, images, resources."
+  - id: network
+    title: "Network issues"
+    description: "Services, endpoints, DNS, NetworkPolicy, Ingress."
+  - id: node
+    title: "Node issues"
+    description: "Cordons, taints, kubelet, capacity, affinity."
+  - id: cluster
+    title: "Cluster issues"
+    description: "Control plane static pods, etcd, scheduler, controller-manager."
+  - id: workload
+    title: "Workload issues"
+    description: "Deployments, rollouts, StatefulSets, Jobs."
+  - id: storage
+    title: "Storage issues"
+    description: "PVC binding, StorageClass, mounts."
+  - id: rbac
+    title: "RBAC & security"
+    description: "ServiceAccounts, roles, bindings, admission."
+  - id: gitops
+    title: "GitOps (Flux)"
+    description: "Sources, kustomizations, drift, suspended objects."
+  - id: helm
+    title: "Helm"
+    description: "Releases, values, failed upgrades, rollbacks."
+
+addons:
+  - id: metrics-server
+    title: "metrics-server"
+    description: "Enables kubectl top and HPA."
+  - id: gitea
+    title: "Gitea (local Git server)"
+    description: "Git server inside the cluster, reachable at http://localhost:30080 (user lab / password labpass123)."
+  - id: flux
+    title: "Flux CD"
+    description: "Installs Flux controllers (flux install) in flux-system."
+  - id: ingress-nginx
+    title: "ingress-nginx"
+    description: "Ingress controller bound to localhost:80/443."
+  - id: cert-manager
+    title: "cert-manager"
+    description: "Certificate CRDs and controllers with a self-signed ClusterIssuer."

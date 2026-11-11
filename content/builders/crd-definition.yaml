@@ -1,0 +1,449 @@
+id: crd-definition
+title: "CustomResourceDefinition: teach the API server a new kind"
+kind: CustomResourceDefinition
+apiVersion: apiextensions.k8s.io/v1
+realm: manifests
+track: crd
+difficulty: intermediate
+estimated_minutes: 25
+summary: >
+  Define a Backup kind under the sre.lab group from scratch: the naming
+  grammar the API server enforces, served versus storage versions, a
+  structural OpenAPI schema with validation, the status subresource and
+  printer columns. Every CRD you meet later (Flux, cert-manager, Gateway API)
+  follows exactly this grammar.
+intro: |
+  This builder defines a CRD. The definition itself is a built-in,
+  cluster-scoped object of the `apiextensions.k8s.io` group, which is why
+  `crd` is false here; the **instances** you will write in
+  `custom-resource-instance` are the custom resources.
+
+  When the API server admits a CRD it does three things: it starts serving a
+  new REST endpoint (`/apis/sre.lab/v1/namespaces/*/backups`), it stores
+  instances in etcd under that group, and it validates every write against
+  the OpenAPI schema you give it. That is all. No controller comes with it. A
+  CRD without a controller is a database table with a schema and a
+  `kubectl` front end; the behaviour comes from a controller that **watches**
+  these objects and reconciles them, exactly like the Deployment controller
+  watches Deployments.
+
+  The grammar is strict and the error messages are not always obvious, so
+  this build goes field by field: naming, scope, versions, schema, then the
+  subresources and columns that make the kind pleasant to operate.
+prerequisites: [deployment-basics]
+crd: false
+docs_url: https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the API that CRDs themselves belong to."
+    why: |
+      CRDs are objects of the `apiextensions.k8s.io` group, served by the
+      apiextensions-apiserver that is compiled into kube-apiserver. `v1`
+      has been the only version since 1.22 and it requires a **structural
+      schema** for every version you declare; `v1beta1` allowed schemaless
+      CRDs that pruned nothing and stored whatever the client sent. Old
+      operator tutorials still show `v1beta1`; the API server rejects it.
+    hint: "Group apiextensions.k8s.io; the stable version that made schemas mandatory."
+    expect: { type: equals, value: apiextensions.k8s.io/v1 }
+    reveal: "apiVersion: apiextensions.k8s.io/v1"
+    gotchas:
+      - "A v1beta1 CRD converted mechanically to v1 fails on `spec.validation`: in v1 the schema moves under each version."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `CustomResourceDefinition` (`kubectl get crd`) is cluster-scoped: there
+      is one definition per kind for the whole cluster, even when the
+      instances are namespaced. Creating one requires RBAC on
+      `customresourcedefinitions` in `apiextensions.k8s.io`, which is close to
+      cluster-admin; application teams get CRDs installed by platform teams
+      or operator bundles, not by their own pipelines.
+    hint: "CamelCase, three words, abbreviated crd by kubectl."
+    expect: { type: equals, value: CustomResourceDefinition }
+    reveal: "kind: CustomResourceDefinition"
+  - path: metadata.name
+    title: "Name: the derived part"
+    prompt: "Name the CRD so that it is the plural joined to the group."
+    why: |
+      This is the first rule of the grammar: `metadata.name` **must** equal
+      `<spec.names.plural>.<spec.group>`. The API server rejects anything
+      else with `must be spec.names.plural+"."+spec.group`. The reason is
+      uniqueness: CRD names are cluster-wide and two groups may both define
+      a `backups` resource (`backups.sre.lab` and `backups.velero.io` can
+      coexist). It also means you cannot rename a CRD; you create a new one
+      and migrate.
+    hint: "Not a free choice: join the plural resource name and the group with a dot."
+    expect: { type: equals, value: backups.sre.lab }
+    reveal: |
+      metadata:
+        name: backups.sre.lab
+    gotchas:
+      - "`backup.sre.lab` (singular) is the most common typo; the error names the rule but not the field you got wrong."
+  - path: spec.group
+    title: "API group"
+    prompt: "Choose the group your kinds will live under."
+    why: |
+      The group becomes the REST path (`/apis/sre.lab/`) and the prefix of
+      `apiVersion` in every instance (`sre.lab/v1`). It must be a DNS
+      subdomain and by convention is a domain you control, so two vendors
+      never collide; `*.k8s.io` and the empty core group are reserved. The
+      group is immutable: change it and you have a different CRD.
+    hint: "A DNS subdomain you own; it will appear in every instance's apiVersion."
+    expect: { type: equals, value: sre.lab }
+    reveal: |
+      spec:
+        group: sre.lab
+  - path: spec.names.plural
+    title: "Plural name"
+    prompt: "Set the resource name used in REST paths and kubectl."
+    why: |
+      `plural` is the *resource* (`kubectl get backups`, the path segment
+      after the version). Lowercase only. It must match the prefix of
+      `metadata.name`, which is the second half of the grammar rule you just
+      applied. RBAC rules also refer to this name: a Role that grants
+      `resources: ["backups"]` is written against this field, not the kind.
+    hint: "Lowercase, the first half of the metadata.name you wrote."
+    expect: { type: equals, value: backups }
+    reveal: |
+      names:
+        plural: backups
+  - path: spec.names.singular
+    title: "Singular name"
+    prompt: "Set the singular alias."
+    why: |
+      kubectl accepts `kubectl get backup` because of this field; it defaults
+      to the lowercased kind if omitted, but write it to be explicit. It is
+      not used in REST paths or RBAC, only in client discovery, which is why
+      a mismatch here is harmless and a mismatch in `plural` is fatal.
+    hint: "Lowercase kind. Only kubectl and discovery use it."
+    expect: { type: equals, value: backup }
+    reveal: "singular: backup"
+  - path: spec.names.kind
+    title: "Kind of the instances"
+    prompt: "Set the CamelCase kind that instances will declare."
+    why: |
+      This is what instances write in `kind:`. The API server builds the
+      list kind (`BackupList`) from it unless you set `listKind`. Kind
+      names are unique per group, not per cluster: a `Backup` in `sre.lab`
+      and a `Backup` in `velero.io` can coexist, and `kubectl get backup`
+      then needs the fully qualified `backups.sre.lab` to disambiguate.
+    hint: "CamelCase, singular. The word you will put after kind: in instances."
+    expect: { type: equals, value: Backup }
+    reveal: "kind: Backup"
+  - path: spec.names.shortNames
+    title: "Short names"
+    prompt: "Give kubectl a short alias."
+    why: |
+      `shortNames` is a list of aliases accepted by kubectl (`kubectl get
+      bk`). Discovery resolves them cluster-wide, so an alias that collides
+      with a built-in (`svc`, `cm`, `deploy`) or another CRD is resolved by
+      kubectl's priority rules and silently points elsewhere. Also consider
+      `categories: [all]` if you want the kind listed by `kubectl get all`,
+      which only shows categorised resources.
+    hint: "A list under spec.names. Keep it short, avoid existing kubectl aliases."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      shortNames:
+        - bk
+    gotchas:
+      - "`kubectl get all` does not list CRs unless the CRD sets `categories: [all]`; nothing is wrong, the kind is just not categorised."
+  - path: spec.scope
+    title: "Scope"
+    prompt: "Decide whether instances live in a namespace."
+    why: |
+      `Namespaced` or `Cluster`, immutable after creation. Namespaced
+      instances get per-namespace RBAC, show up in namespace quotas, and are
+      garbage-collected when the namespace is deleted. Cluster scope is for
+      things that genuinely span namespaces (a ClusterIssuer, a node pool).
+      Most mistakes go the other way: a cluster-scoped kind that references
+      namespaced objects by name needs its controller to be cluster-wide
+      privileged, which is a security review question.
+    hint: "Two values. Which one lets a tenant manage its own backups without cluster-wide rights?"
+    expect: { type: equals, value: Namespaced }
+    reveal: "scope: Namespaced"
+  - path: spec.versions
+    title: "Versions list"
+    prompt: "Open the versions list with one version."
+    why: |
+      A CRD serves one or more versions of the same kind. Each entry carries
+      its own schema, subresources and printer columns. The list is how you
+      evolve the API: add `v2`, serve both, flip storage, stop serving `v1`.
+      Exactly one entry must have `storage: true`; the API server converts
+      between versions on read and write, by default with `conversion.strategy:
+      None` (same bytes, different apiVersion) or through a webhook.
+    hint: "A list of maps; each needs name, served, storage and a schema."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, served, storage, schema] } }
+    reveal: |
+      versions:
+        - name: v1
+          served: true
+          storage: true
+          schema:
+            openAPIV3Schema:
+              type: object
+  - path: spec.versions[0].served
+    title: "Served"
+    prompt: "Make this version reachable through the API."
+    why: |
+      `served: false` keeps a version in the definition (and keeps existing
+      objects readable through the other versions) while refusing REST calls
+      that name it. It is the deprecation switch: clients get a 404 for
+      `sre.lab/v1alpha1` while nothing is deleted. A CRD with all versions
+      unserved is valid and useless.
+    hint: "A boolean. true means clients may talk to this version."
+    expect: { type: boolean }
+    reveal: "served: true"
+  - path: spec.versions[0].storage
+    title: "Storage"
+    prompt: "Make this the version persisted in etcd."
+    why: |
+      Objects are stored in etcd in exactly one version, whatever version the
+      client used to write them. Flipping `storage` to a new version does
+      **not** rewrite existing objects: they stay in the old encoding until
+      something writes them again, and `status.storedVersions` keeps the
+      list. That is why removing an old version from a CRD requires a storage
+      migration first, or the API server refuses with `status.storedVersions[0]:
+      Invalid value: "v1": missing from spec.versions; v1 was previously a
+      storage version, and must remain in spec.versions` (and a list with no
+      or two storage versions fails with `must have exactly one version
+      marked as storage version`).
+    hint: "A boolean; exactly one version in the list may carry true."
+    expect: { type: boolean }
+    reveal: "storage: true"
+    gotchas:
+      - "Changing the storage version and then deleting the old one without migrating objects breaks reads of every unmigrated instance."
+  - path: spec.versions[0].schema.openAPIV3Schema.type
+    title: "Structural schema root"
+    prompt: "Declare the root of the schema as an object."
+    why: |
+      v1 requires a **structural** schema: the root is `type: object`, every
+      property declares a `type`, and `anyOf`/`oneOf`/`not` may only add
+      constraints, never define types. The API server needs this to **prune**:
+      any field in a request that the schema does not know is dropped before
+      storage. That protects etcd from junk, but what the client sees depends
+      on its field validation: `kubectl apply` (strict by default since 1.27)
+      is rejected with `strict decoding error: unknown field ...`, while a
+      controller or `kubectl --validate=false` gets the misspelt field pruned
+      silently. Only `x-kubernetes-preserve-unknown-fields` keeps such fields.
+    hint: "schema.openAPIV3Schema.type; the only value allowed at the root."
+    expect: { type: equals, value: object }
+    reveal: |
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+            status:
+              type: object
+    gotchas:
+      - "A property without `type` makes the schema non-structural; apiextensions.k8s.io/v1 rejects the CRD outright, where v1beta1 used to accept it and flag NonStructuralSchema in status."
+  - path: spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.schedule.pattern
+    title: "Validate schedule with an anchored pattern"
+    prompt: "Constrain spec.schedule to a five-field cron expression."
+    why: |
+      `pattern` is an ECMA 262 regex and, like every OpenAPI pattern, it is a
+      **search**, not a full match: `[0-9]+` accepts `abc 5 def`. Anchor it
+      with `^` and `$` or the validation is decorative. Validation happens in
+      the API server at admission, before any controller sees the object,
+      so a bad schedule is rejected with a 422 instead of being discovered
+      by a crash loop at 02:00.
+    hint: "A string under the schedule property, next to type: string. Anchor both ends."
+    expect: { type: regex, value: '^\^.*\$$' }
+    reveal: |
+      spec:
+        type: object
+        properties:
+          schedule:
+            type: string
+            pattern: '^(\S+\s+){4}\S+$'
+    gotchas:
+      - "YAML double quotes eat backslashes: write patterns in single quotes or double every backslash."
+  - path: spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.retention.minimum
+    title: "Validate retention as a bounded integer"
+    prompt: "Make spec.retention an integer with a lower bound."
+    why: |
+      `type: integer` rejects `"7"` (a string) and `7.5`; `minimum` and
+      `maximum` bound it; `default` fills it in at admission when omitted.
+      Numeric and string validators cover one field at a time. Rules across
+      fields (retention must exceed the schedule interval) need
+      `x-kubernetes-validations` with a CEL expression, GA since 1.29, which
+      is the modern alternative to a validating webhook.
+    hint: "An integer under the retention property. What is the smallest retention that makes sense?"
+    expect: { type: integer }
+    reveal: |
+      retention:
+        type: integer
+        minimum: 1
+        maximum: 365
+        default: 7
+  - path: spec.versions[0].schema.openAPIV3Schema.properties.spec.required
+    title: "Required fields"
+    prompt: "List the spec fields an instance must provide."
+    why: |
+      `required` is a list of property names at *this* level of the schema.
+      Making `schedule` required here does nothing unless `spec` itself is
+      required at the root (`openAPIV3Schema.required: [spec]`), because an
+      instance with no `spec` at all satisfies every rule inside it. Fields
+      with a `default` do not need to be required: defaulting runs before
+      validation, so the field is always present by the time `required` is
+      checked.
+    hint: "A list of property names, sibling of properties, at the spec level."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      required:
+        - schedule
+        - target
+    gotchas:
+      - "required on a nested object only applies when that object is present; make the parent required too."
+  - path: spec.versions[0].subresources.status
+    title: "Status subresource"
+    prompt: "Enable the status subresource for this version."
+    why: |
+      With `subresources.status: {}` the API server serves a second endpoint,
+      `.../backups/<name>/status`. Writes to the main endpoint **ignore**
+      `status`, writes to `/status` ignore everything else, and
+      `metadata.generation` increments only when `spec` changes. That split is
+      what lets a controller publish `status.observedGeneration` and compare
+      it to `metadata.generation` to know whether it has seen the latest
+      intent. It also makes `backups/status` a separate RBAC resource, so
+      users can edit specs without being able to forge a status.
+    hint: "subresources is a sibling of schema inside the version; status takes an empty map."
+    expect: { type: exists }
+    reveal: |
+      subresources:
+        status: {}
+    gotchas:
+      - "Without the subresource, metadata.generation also increments on status writes, so observedGeneration never settles and anyone who can update backups can forge a status."
+  - path: spec.versions[0].additionalPrinterColumns
+    title: "Printer columns"
+    prompt: "Add columns so kubectl get shows something useful."
+    why: |
+      Without printer columns `kubectl get backups` shows only NAME and AGE.
+      Each column is a `name`, a `type` (string, integer, boolean, date) and
+      a `jsonPath` evaluated on the object server-side. A `date` column
+      renders as a relative age. `priority: 1` hides a column unless
+      `-o wide`. Columns reading `.status.*` are the operator's first view of
+      what the controller did, which is why every mature CRD has a `Ready` or
+      `Phase` column.
+    hint: "A list of maps with name, type and jsonPath, sibling of schema inside the version."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, type, jsonPath] } }
+    reveal: |
+      additionalPrinterColumns:
+        - name: Schedule
+          type: string
+          jsonPath: .spec.schedule
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+final_manifest: |
+  apiVersion: apiextensions.k8s.io/v1
+  kind: CustomResourceDefinition
+  metadata:
+    name: backups.sre.lab
+  spec:
+    group: sre.lab
+    names:
+      plural: backups
+      singular: backup
+      kind: Backup
+      listKind: BackupList
+      shortNames:
+        - bk
+    scope: Namespaced
+    versions:
+      - name: v1
+        served: true
+        storage: true
+        schema:
+          openAPIV3Schema:
+            type: object
+            required:
+              - spec
+            properties:
+              spec:
+                type: object
+                required:
+                  - schedule
+                  - target
+                properties:
+                  schedule:
+                    type: string
+                    pattern: '^(\S+\s+){4}\S+$'
+                  retention:
+                    type: integer
+                    minimum: 1
+                    maximum: 365
+                    default: 7
+                  suspend:
+                    type: boolean
+                    default: false
+                  target:
+                    type: object
+                    required:
+                      - pvcName
+                    properties:
+                      pvcName:
+                        type: string
+                        minLength: 1
+              status:
+                type: object
+                properties:
+                  observedGeneration:
+                    type: integer
+                  phase:
+                    type: string
+                    enum:
+                      - Pending
+                      - Running
+                      - Succeeded
+                      - Failed
+                  lastRunTime:
+                    type: string
+                    format: date-time
+                  message:
+                    type: string
+        subresources:
+          status: {}
+        additionalPrinterColumns:
+          - name: Schedule
+            type: string
+            jsonPath: .spec.schedule
+          - name: Phase
+            type: string
+            jsonPath: .status.phase
+          - name: Age
+            type: date
+            jsonPath: .metadata.creationTimestamp
+apply:
+  mode: dry-run
+  requires_addons: []
+quiz:
+  - q: "spec.names.plural is backups and spec.group is sre.lab, but metadata.name is backup.sre.lab. What happens on apply?"
+    options:
+      - "Accepted; kubectl uses the singular"
+      - "Rejected: metadata.name must be spec.names.plural + \".\" + spec.group"
+      - "Accepted with a warning event"
+      - "Accepted; the name is rewritten by the API server"
+    answer: 1
+    explain: "The name is derived, not chosen. The API server enforces the plural.group grammar on create."
+  - q: "A controller (or kubectl apply --validate=false) sends an instance with spec.retentionDays: 30, a field the schema does not declare. What is stored?"
+    options:
+      - "The object is rejected with an unknown field error"
+      - "The field is stored as-is"
+      - "The field is silently pruned before storage"
+      - "The field is stored under status"
+    answer: 2
+    explain: "Structural schemas prune unknown fields for non-strict clients; only x-kubernetes-preserve-unknown-fields keeps them. With kubectl's default strict field validation the same request is rejected with an unknown field error instead."
+  - q: "With subresources.status enabled, a client PUTs the whole object with a modified status.phase to the main endpoint. Result?"
+    options:
+      - "status.phase is updated"
+      - "The request is rejected"
+      - "The write succeeds but status changes are ignored; only /status accepts them"
+      - "metadata.generation increments"
+    answer: 2
+    explain: "The main endpoint drops status; the /status endpoint drops spec. generation only moves on spec changes."

@@ -1,0 +1,47 @@
+id: resourcequota-blocks-rollout
+title: "Deployment stuck at 2 of 5 replicas"
+realm: scenarios
+category: config
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [resourcequota, replicaset, FailedCreate, requests]
+requires_addons: []
+summary: "The api Deployment in lab-quota was scaled to 5 for a launch but only 2 Pods ever appear. No Pending Pods, no errors on the Deployment, no node pressure. Find who is refusing to create the other three."
+brief: |
+  **Ticket #5171 — P2 — api scaled to 5, only 2 Pods exist**
+
+  Ahead of tonight's launch the api team scaled their `api` Deployment in
+  namespace `lab-quota` from 2 to 5 replicas. Twenty minutes later
+  `kubectl get deploy` still shows `2/5` and `kubectl get pods` lists only
+  two Pods, both healthy. There are no Pending Pods to describe, the nodes
+  have plenty of free CPU and memory, and nothing was changed in the
+  manifest except `replicas`.
+
+  The team tried `kubectl rollout restart`, which did not help, and asks
+  whether the scheduler is broken.
+
+  ## Your task
+  - All 5 replicas of `api` `Running` and `Ready` in namespace `lab-quota` (`spec.replicas` stays 5).
+  - The namespace must keep its `ResourceQuota` (`team-quota`): do not delete it or remove its CPU limit; adjust it or the workload.
+  - Containers must keep a CPU request.
+namespace: lab-quota
+hints:
+  - "No Pod means nothing for the scheduler to do. The object that *creates* Pods is the ReplicaSet: kubectl describe rs -n lab-quota -l app=api and read the Events (also `kubectl get deploy api -o yaml` conditions, type ReplicaFailure)."
+  - "`exceeded quota: team-quota, requested: requests.cpu=20m, used: requests.cpu=40m, limited: requests.cpu=50m`. kubectl describe quota -n lab-quota shows every dimension and its usage."
+  - "Two valid fixes: raise `requests.cpu` in the quota (5 replicas x 20m = 100m, plus one surge Pod for rollouts, so 200m is comfortable), or lower each container's request so five fit. Never silently delete the quota."
+  - "Pods still missing a minute after the fix? The ReplicaSet controller backs off exponentially after repeated failures (look at the FailedCreate timestamps). Force an immediate retry: kubectl rollout restart deploy/api -n lab-quota, or scale to 0 and back to 5."
+checks:
+  - name: "ResourceQuota team-quota still exists and still limits requests.cpu"
+    cmd: test -n "$(kubectl get resourcequota -n lab-quota team-quota -o jsonpath='{.spec.hard.requests\.cpu}')"
+  - name: "Deployment api desires 5 replicas and all 5 are ready"
+    cmd: kubectl rollout status -n lab-quota deploy/api --timeout=20s >/dev/null && test "$(kubectl get deploy -n lab-quota api -o jsonpath='{.spec.replicas}/{.status.readyReplicas}')" = "5/5"
+  - name: "Five api Pods are Running"
+    cmd: test "$(kubectl get pods -n lab-quota -l app=api --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)" -ge 5
+  - name: "Containers still declare a CPU request"
+    cmd: test -n "$(kubectl get deploy -n lab-quota api -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}')"
+concepts:
+  - "A ResourceQuota is enforced by an admission plugin at Pod *creation*. Refused Pods never exist, so there is nothing Pending to describe; the error lives on the creator (ReplicaSet Events, Deployment condition ReplicaFailure)."
+  - "`kubectl describe quota` shows used/hard per dimension; a request that would push `used` over `hard` is rejected even if the nodes are empty. Quotas on requests.* also require every container to set that request."
+  - "Controllers retry failed creates with exponential backoff (up to minutes). After fixing a quota, a rollout restart or a scale bump forces an immediate reconcile."
+related_lessons: [troubleshooting/config-triage]

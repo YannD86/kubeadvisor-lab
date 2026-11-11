@@ -1,0 +1,232 @@
+id: configmap-basics
+title: "ConfigMap: configuration as an API object, not a file on a node"
+kind: ConfigMap
+apiVersion: v1
+realm: manifests
+track: core
+difficulty: beginner
+estimated_minutes: 12
+summary: >
+  Build a ConfigMap with scalar keys and a whole config file, then make it
+  immutable. Learn how kubelet projects it into env vars and volumes, why
+  values must be strings, and why immutability changes both your rollout model
+  and the load on the API server.
+intro: |
+  A ConfigMap is a map of string keys to string values stored in etcd. No
+  controller reconciles it. It does nothing until a Pod references it, at
+  which point the **kubelet** on that node fetches it and projects it into the
+  container in one of two ways:
+
+  - as environment variables (`env[].valueFrom.configMapKeyRef` or
+    `envFrom`), read once when the container starts and never updated;
+  - as files in a volume, written by the kubelet and refreshed when the
+    object changes (roughly once a minute: kubelet sync period plus cache TTL),
+    except for `subPath` mounts, which are never refreshed.
+
+  That difference is the first thing to know. The second is that the object is
+  consumed by every kubelet whose Pods mount it: a ConfigMap referenced by
+  2,000 Pods spread over 500 nodes is 500 watches on the API server (one
+  watch per node per referenced object, not per Pod). `immutable: true` is
+  how you switch those watches off and, as a side effect, forces
+  configuration changes to go through a proper rollout.
+prerequisites: [deployment-basics]
+crd: false
+docs_url: https://kubernetes.io/docs/concepts/configuration/configmap/
+steps:
+  - path: apiVersion
+    title: "API version"
+    prompt: "Declare the API this object speaks."
+    why: |
+      ConfigMap is a core-group object, so the version is a bare `v1`. It is
+      served from `/api/v1/namespaces/<ns>/configmaps` and persisted in etcd
+      like any other object, which is where its size limit comes from: an
+      etcd value is capped at about 1 MiB, and the API server enforces
+      1 MiB for the whole ConfigMap (data plus binaryData).
+    hint: "Core group, no prefix."
+    expect: { type: equals, value: v1 }
+    reveal: "apiVersion: v1"
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `ConfigMap` and `Secret` share the same shape (a `data` map, an
+      optional `binaryData` map, an `immutable` flag) and the same projection
+      code in the kubelet. The only differences are base64 encoding, RBAC
+      defaults and that Secrets can be encrypted at rest. Anything you learn
+      here applies to Secrets.
+    hint: "CamelCase, one word."
+    expect: { type: equals, value: ConfigMap }
+    reveal: "kind: ConfigMap"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the ConfigMap; a version or hash suffix is a good habit."
+    why: |
+      Pods reference a ConfigMap by exact name, and the kubelet refuses to
+      start a container whose ConfigMap reference does not resolve
+      (`CreateContainerConfigError`), unless the reference is marked
+      `optional: true`. ConfigMap names are DNS *subdomains*, so dots are
+      allowed, unlike Service names. Tools such as kustomize's
+      `configMapGenerator` append a content hash (`web-config-5f8k7t4m2b`) so
+      that every change produces a new object and a new Pod template.
+    hint: "Lowercase DNS subdomain. A suffix you can bump makes the next step work."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: web-config-v2
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Put it next to the Pods that will consume it."
+    why: |
+      A Pod can only reference ConfigMaps in its own namespace; there is no
+      cross-namespace reference at all. Sharing configuration across
+      namespaces means copying the object (or using a tool that does it for
+      you), which is a reason to keep shared values out of ConfigMaps and
+      in your deployment tooling.
+    hint: "Same namespace as the Deployment that will mount it."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+  - path: metadata.labels.app
+    title: "Labels"
+    prompt: "Label the ConfigMap with app: web."
+    why: |
+      Labels are how you find orphaned ConfigMaps: once you version names, old
+      generations accumulate and `kubectl get cm -l app=web` is how you prune
+      them (kustomize and Helm do not garbage-collect previous generations
+      unless told to). Labels are also what Flux's and Argo's pruning keys on
+      to know which objects belong to which release.
+    hint: "metadata.labels is a map; mirror the workload's app label."
+    expect: { type: equals, value: web }
+    reveal: |
+      labels:
+        app: web
+  - path: data.LOG_LEVEL
+    title: "A scalar key"
+    prompt: "Add a scalar setting LOG_LEVEL."
+    why: |
+      `data` is a flat map; nesting is not allowed. Keys are shaped like
+      environment variables when the ConfigMap is meant for `envFrom`: the
+      kubelet exports every key as a variable. Since
+      `RelaxedEnvironmentVariableValidation` (GA in 1.34) a key with a dash
+      or a dot is exported too, where older kubelets skipped it with an
+      event; such names are legal but awkward to consume (no shell can
+      reference `a.b`). Keys meant for files can be anything matching
+      `[-._a-zA-Z0-9]+`.
+    hint: "A top-level data map, sibling of metadata. Pick a value a logger understands."
+    expect: { type: regex, value: "^(trace|debug|info|warn|warning|error)$" }
+    reveal: |
+      data:
+        LOG_LEVEL: info
+  - path: data.MAX_CONNECTIONS
+    title: "A numeric-looking value"
+    prompt: "Add MAX_CONNECTIONS with a numeric value."
+    why: |
+      `data` is `map[string]string`. A bare `100` is parsed by YAML as an
+      integer and the API server rejects the object with `cannot unmarshal
+      number into Go struct field ConfigMap.data of type string`. The same
+      trap exists for `true`, `false`, `yes`, `no`, `on`, `off` (YAML 1.1
+      booleans), `1e3` and `0x1f`. Quote anything that is not obviously text.
+      Your application parses the string anyway.
+    hint: "Values are strings. Think about what the YAML parser does with a bare number."
+    expect: { type: regex, value: "^[0-9]+$" }
+    reveal: 'MAX_CONNECTIONS: "100"'
+    gotchas:
+      - "`ENABLED: yes` is a YAML 1.1 boolean and is rejected; `ENABLED: \"yes\"` is accepted."
+      - "kubectl create configmap --from-literal always produces strings; it is the hand-written manifest that bites."
+  - path: data.default-conf
+    title: "A whole file as one key"
+    prompt: "Embed an nginx server block as a multi-line value."
+    why: |
+      A `|` block scalar keeps newlines, so a whole file fits in one key. When
+      the ConfigMap is mounted as a volume, each key becomes a file named
+      after the key; `volumes[].configMap.items[].path` renames it (here
+      `default-conf` becomes `default.conf`) and `defaultMode` sets the
+      permissions. The kubelet writes files into a timestamped directory and
+      swaps a symlink, so a reader never sees a half-written file. That
+      atomic swap is also why `subPath` mounts never update: they bind the
+      old inode.
+    hint: "Use a | block scalar under data; indentation of the content is relative to the key."
+    expect: { type: regex, value: "(?s).*listen\\s+[0-9]+;.*" }
+    reveal: |
+      default-conf: |
+        server {
+          listen 8080;
+          server_name _;
+          location / {
+            proxy_pass http://api:8080;
+          }
+          location /healthz {
+            return 200 'ok';
+          }
+        }
+    gotchas:
+      - "Mounting the ConfigMap at /etc/nginx replaces the whole directory (mime.types disappears). Mount at conf.d or use items/subPath."
+      - "A subPath mount is never refreshed; the Pod must be restarted to see a change."
+  - path: immutable
+    title: "Immutable"
+    prompt: "Freeze the object."
+    why: |
+      With `immutable: true` the API server rejects any change to `data` or
+      `binaryData`; you can only delete the object. Two consequences. Safety:
+      nobody hot-edits configuration under running Pods, so a change is a new
+      ConfigMap name plus a Pod template update, which is a rollout with
+      history and rollback. Scale: the kubelet stops watching an immutable
+      ConfigMap once it has been read, so thousands of Pods no longer hold
+      thousands of watches open on the API server. It is a top-level field,
+      a sibling of `data`, not part of `metadata`.
+    hint: "A top-level boolean at the same level as data, not under metadata."
+    expect: { type: boolean }
+    reveal: "immutable: true"
+    gotchas:
+      - "You cannot set immutable back to false. Delete and recreate under the same name, and Pods keep the stale files until they restart because the kubelet no longer watches."
+      - "A Deployment that still references the old name after you bump it is a CreateContainerConfigError, not a rollout."
+final_manifest: |
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: web-config-v2
+    namespace: lab-build
+    labels:
+      app: web
+  data:
+    LOG_LEVEL: info
+    MAX_CONNECTIONS: "100"
+    default-conf: |
+      server {
+        listen 8080;
+        server_name _;
+        location / {
+          proxy_pass http://api:8080;
+        }
+        location /healthz {
+          return 200 'ok';
+        }
+      }
+  immutable: true
+apply:
+  mode: create
+  requires_addons: []
+quiz:
+  - q: "A mutable ConfigMap is consumed via envFrom by a running Pod. You edit LOG_LEVEL. When does the container see the new value?"
+    options:
+      - "Within about a minute, like volume files"
+      - "At the next kubelet sync"
+      - "Never: environment variables are read once at container start; the Pod must be recreated"
+      - "Immediately, the kubelet signals the process"
+    answer: 2
+    explain: "Env vars are rendered into the container spec at start. Only volume projections (without subPath) are refreshed."
+  - q: "The ConfigMap is immutable and you need a new LOG_LEVEL. What is the correct change?"
+    options:
+      - "kubectl edit the ConfigMap; immutable only blocks deletion"
+      - "Create a ConfigMap with a new name and update the Deployment to reference it, which triggers a rollout"
+      - "Patch immutable to false first, then edit"
+      - "Restart the Pods; the kubelet re-reads the file"
+    answer: 1
+    explain: "Immutable data cannot be edited and the flag cannot be unset. A new name plus a Pod template change gives you a rollout with rollback."
+  - q: "Why does immutable: true reduce load on the API server?"
+    options:
+      - "Immutable objects are not stored in etcd"
+      - "The kubelet stops watching an immutable ConfigMap once read, so each node mounting it no longer holds a watch"
+      - "kube-proxy skips immutable objects"
+      - "It does not; it is only a safety feature"
+    answer: 1
+    explain: "The kubelet holds one watch per node per referenced object (not per Pod); across hundreds of nodes this is one of the largest sources of apiserver watch load."

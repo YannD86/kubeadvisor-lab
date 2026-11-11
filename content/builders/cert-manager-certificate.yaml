@@ -1,0 +1,325 @@
+id: cert-manager-certificate
+title: "cert-manager Certificate: request and renew a TLS secret"
+kind: Certificate
+apiVersion: cert-manager.io/v1
+realm: manifests
+track: security
+difficulty: intermediate
+estimated_minutes: 18
+summary: >
+  Build a Certificate for podinfo issued by the lab's selfsigned
+  ClusterIssuer, with SANs, lifetime, renewal window, an ECDSA key that
+  rotates on every issuance and explicit usages, and learn the chain of
+  objects cert-manager creates behind it.
+intro: |
+  A `Certificate` is a desired TLS key pair expressed as a Secret:
+  "keep `secretName` filled with a valid cert for these names, signed by
+  this issuer, and renew it before it expires". The cert-manager
+  controller turns that into a chain of objects you will meet while
+  debugging:
+
+  `Certificate` → generates a private key (kept in a temporary Secret
+  until issuance succeeds) → `CertificateRequest` (CSR + issuer ref) →
+  the issuer's controller signs it. For ACME issuers the request fans out
+  into an `Order` and one `Challenge` per DNS name (HTTP-01 or DNS-01);
+  for CA, self-signed, Vault or Venafi issuers the CertificateRequest is
+  signed directly. The signed chain lands in the Secret as `tls.crt`,
+  `tls.key` and `ca.crt`, annotated with the issuer and the Certificate
+  name, and `status.notAfter` and `status.renewalTime` tell you when the
+  cycle restarts.
+
+  `kubectl describe certificate` then `kubectl get certificaterequest,
+  order, challenge -n <ns>` is the diagnostic path, in that order. The lab
+  cluster provides a `ClusterIssuer` named `selfsigned`.
+prerequisites: [deployment-basics]
+crd: true
+docs_url: https://cert-manager.io/docs/usage/certificate/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the cert-manager API."
+    why: |
+      All user-facing cert-manager kinds (Certificate, Issuer,
+      ClusterIssuer, CertificateRequest) are in `cert-manager.io/v1`;
+      ACME internals (Order, Challenge) live in `acme.cert-manager.io/v1`.
+      `v1alpha2`, `v1alpha3` and `v1beta1` were removed in cert-manager
+      1.6, so old Helm charts that still emit them fail at admission.
+    hint: "The group is the project domain; version v1."
+    expect: { type: equals, value: cert-manager.io/v1 }
+    reveal: "apiVersion: cert-manager.io/v1"
+    gotchas:
+      - "certmanager.k8s.io (the pre-1.0 group) is a different, dead API; the CRDs no longer exist."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `Certificate` is the declarative entry point. You can also create a
+      `CertificateRequest` by hand with your own CSR, or let the
+      ingress-shim create Certificates from Ingress annotations
+      (`cert-manager.io/cluster-issuer`), but a Certificate object in Git
+      is the only form that survives Ingress rewrites and lets you set key
+      and lifetime parameters.
+    hint: "CamelCase, singular."
+    expect: { type: equals, value: Certificate }
+    reveal: "kind: Certificate"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the Certificate."
+    why: |
+      Used as the prefix of the generated CertificateRequests
+      (`podinfo-tls-<suffix>`) and stored in the Secret annotation
+      `cert-manager.io/certificate-name`, which is how cert-manager knows
+      a Secret belongs to it. Naming the Certificate after the Secret it
+      fills keeps the chain readable.
+    hint: "Lowercase DNS label; conventionally the same as secretName."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: podinfo-tls
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place it where the TLS Secret must appear."
+    why: |
+      The Secret is created in the Certificate's namespace and Secrets
+      cannot be referenced across namespaces, so this must be the
+      namespace of the Ingress, Gateway or Pod that will mount it. A
+      ClusterIssuer can sign for any namespace; a namespaced Issuer only
+      for its own.
+    hint: "Same lab-* namespace as the workload that terminates TLS."
+    expect: { type: regex, value: "^lab-[a-z0-9-]+$" }
+    reveal: "  namespace: lab-podinfo"
+  - path: spec.secretName
+    title: "Target Secret"
+    prompt: "Name the Secret that will hold the key pair."
+    why: |
+      Required. cert-manager creates or updates a `kubernetes.io/tls`
+      Secret with this name and keeps it current. Two Certificates must
+      never share a `secretName`: they would overwrite each other's key
+      and renew in a loop. Deleting the Certificate does **not** delete the
+      Secret unless the controller runs with
+      `--enable-certificate-owner-ref=true`, which is why stale TLS
+      Secrets accumulate.
+    hint: "A Secret name in this namespace; the Ingress tls.secretName will reference it."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: |
+      spec:
+        secretName: podinfo-tls
+    gotchas:
+      - "If the Secret already exists with a key that does not match the spec, cert-manager reissues; with a manually created cert it overwrites it."
+  - path: spec.dnsNames
+    title: "DNS names"
+    prompt: "List every hostname the certificate must be valid for."
+    why: |
+      These become Subject Alternative Names, the only thing modern
+      clients validate. Include every name the service answers on: the
+      external host and, if Pods call it in-cluster over TLS, the Service
+      DNS name. Wildcards (`*.lab.local`) are allowed but ACME only issues
+      them through DNS-01 challenges.
+    hint: "A list of strings; SANs are what browsers check."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      dnsNames:
+        - podinfo.lab.local
+        - podinfo.lab-podinfo.svc.cluster.local
+    gotchas:
+      - "Adding a name later triggers a full reissue, and for ACME a new challenge for every name, not just the new one."
+  - path: spec.commonName
+    title: "Common name"
+    prompt: "Set a common name that is also in dnsNames."
+    why: |
+      The CN is legacy: browsers have ignored it for hostname validation
+      since 2017 and it is limited to 64 characters, which long cluster
+      names exceed. Some private CAs and old Java clients still require
+      it. When you set it, repeat it in `dnsNames`; when you omit it,
+      cert-manager leaves the subject CN empty rather than copying the
+      first SAN, which some CAs reject.
+    hint: "At most 64 characters; pick the primary DNS name."
+    expect: { type: regex, value: "^.{1,64}$" }
+    reveal: "commonName: podinfo.lab.local"
+  - path: spec.issuerRef.name
+    title: "Issuer name"
+    prompt: "Reference the lab's selfsigned issuer."
+    why: |
+      `issuerRef` chooses who signs. The reference is resolved when the
+      CertificateRequest is created; a missing issuer leaves the request
+      pending with `IssuerNotFound` rather than failing the Certificate,
+      so the Secret simply never appears. The lab addon installs a
+      ClusterIssuer called `selfsigned`; production uses an ACME issuer
+      or a CA issuer backed by an internal root.
+    hint: "The issuer name created by the cert-manager addon."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      issuerRef:
+        name: selfsigned
+  - path: spec.issuerRef.kind
+    title: "Issuer kind"
+    prompt: "State that it is cluster-scoped."
+    why: |
+      `kind` defaults to `Issuer`, which is namespaced. Referencing a
+      ClusterIssuer without `kind: ClusterIssuer` makes cert-manager look
+      for an `Issuer` named `selfsigned` in `lab-podinfo`, find nothing,
+      and wait forever with `IssuerNotFound`. This is the most common
+      reason a Certificate stays `Ready: False` with no other error.
+    hint: "Two kinds exist; the lab's issuer is not namespaced."
+    expect: { type: oneOf, value: [Issuer, ClusterIssuer] }
+    reveal: "kind: ClusterIssuer"
+    gotchas:
+      - "kubectl get clusterissuer,issuer -A shows which one actually exists."
+  - path: spec.issuerRef.group
+    title: "Issuer group"
+    prompt: "Specify the API group of the issuer."
+    why: |
+      Defaults to `cert-manager.io`, the built-in issuers. External
+      issuers register their own groups (`awspca.cert-manager.io` for
+      AWS Private CA, `cas-issuer.jetstack.io` for Google CAS,
+      `certmanager.step.sm` for step-ca) and cert-manager hands the
+      CertificateRequest to whichever controller claims that group.
+      Writing it makes the manifest explicit about which controller must
+      be running.
+    hint: "The built-in issuers belong to the project's own group."
+    expect: { type: regex, value: "^[a-z0-9.-]+$" }
+    reveal: "group: cert-manager.io"
+  - path: spec.duration
+    title: "Requested lifetime"
+    prompt: "Ask for a 90-day certificate."
+    why: |
+      A Go duration (`2160h`; there is no `d` unit) sent to the issuer as
+      the requested validity. The default is 90 days. The issuer has the
+      last word: Let's Encrypt ignores it and issues its own lifetime, and
+      cert-manager then schedules renewal from the **actual** `notAfter`
+      of the issued certificate, so always read `status.notAfter` rather
+      than this field.
+    hint: "Go duration in hours; 90 days is 2160h."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: "duration: 2160h"
+    gotchas:
+      - "duration: 90d is rejected at admission by the cert-manager webhook (Go time.ParseDuration has no day unit; the CRD schema itself is a plain string); hours are the largest unit."
+  - path: spec.renewBefore
+    title: "Renewal window"
+    prompt: "Renew 30 days before expiry."
+    why: |
+      When unset, cert-manager renews at two thirds of the lifetime. An
+      explicit `renewBefore` must be smaller than the actual certificate
+      duration; a value larger than it is treated as invalid and the
+      default applies. For ACME keep the window wide enough to survive a
+      multi-day CA outage, but not so wide that you hit rate limits by
+      renewing weekly.
+    hint: "Go duration shorter than duration; 30 days is 720h."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: "renewBefore: 720h"
+  - path: spec.privateKey.algorithm
+    title: "Key algorithm"
+    prompt: "Use an ECDSA key."
+    why: |
+      `RSA` (default, 2048 bits), `ECDSA` or `Ed25519`. ECDSA P-256 gives
+      smaller certificates and faster handshakes than RSA 2048 at
+      equivalent strength and is accepted by every modern client and CA;
+      Ed25519 is not yet supported by public CAs. Changing the algorithm
+      on an existing Certificate only takes effect on the next issuance
+      and only if the key is actually regenerated (see rotationPolicy).
+    hint: "Three values exist; the elliptic-curve one works with Let's Encrypt."
+    expect: { type: oneOf, value: [RSA, ECDSA, Ed25519] }
+    reveal: |
+      privateKey:
+        algorithm: ECDSA
+  - path: spec.privateKey.size
+    title: "Key size"
+    prompt: "Pick the curve size."
+    why: |
+      For RSA this is the modulus (2048, 4096 or 8192; default 2048); for
+      ECDSA it selects the curve (256 = P-256, 384 = P-384, 521 = P-521)
+      and Ed25519 ignores it. The CRD validates the allowed values, so
+      `ECDSA` with `2048` is rejected at admission rather than at issuance
+      time.
+    hint: "An integer that matches the algorithm."
+    expect: { type: integer }
+    reveal: "size: 256"
+  - path: spec.privateKey.rotationPolicy
+    title: "Rotation policy"
+    prompt: "Generate a fresh private key on every issuance."
+    why: |
+      This is the field people get wrong. With `Never`, the historical
+      default, cert-manager **reuses** the existing private key from the
+      Secret on every renewal: a leaked key stays valid through every
+      renewal, and a changed `algorithm` or `size` is silently ignored.
+      `Always` generates a new key per issuance, which is what every
+      security review expects. Newer cert-manager releases made `Always`
+      the default for new Certificates; write it explicitly so behaviour
+      does not depend on the controller version.
+    hint: "Two values; the one that regenerates the key."
+    expect: { type: equals, value: Always }
+    reveal: "rotationPolicy: Always"
+    gotchas:
+      - "With Never, re-keying requires deleting the Secret by hand; cert-manager then creates a key and reissues."
+      - "Workloads that cache the key (HAProxy, Java keystores) need a reload after rotation; ingress-nginx picks it up automatically."
+  - path: spec.usages
+    title: "Key usages"
+    prompt: "Declare server auth usage explicitly."
+    why: |
+      Defaults to `digital signature` and `key encipherment`, with no
+      Extended Key Usage. Public ACME CAs add `server auth` themselves,
+      but CA and self-signed issuers put exactly what you request in the
+      certificate, and browsers reject a leaf certificate without the
+      `server auth` EKU. Add `client auth` only for mTLS client
+      certificates.
+    hint: "A list of strings with spaces inside, e.g. server auth."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      usages:
+        - digital signature
+        - key encipherment
+        - server auth
+final_manifest: |
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: podinfo-tls
+    namespace: lab-podinfo
+  spec:
+    secretName: podinfo-tls
+    commonName: podinfo.lab.local
+    dnsNames:
+      - podinfo.lab.local
+      - podinfo.lab-podinfo.svc.cluster.local
+    issuerRef:
+      name: selfsigned
+      kind: ClusterIssuer
+      group: cert-manager.io
+    duration: 2160h
+    renewBefore: 720h
+    privateKey:
+      algorithm: ECDSA
+      size: 256
+      rotationPolicy: Always
+    usages:
+      - digital signature
+      - key encipherment
+      - server auth
+apply:
+  mode: dry-run
+  requires_addons: [cert-manager]
+quiz:
+  - q: "A Certificate stays Ready: False and kubectl describe shows IssuerNotFound, but kubectl get clusterissuer lists selfsigned. What is wrong?"
+    options:
+      - "The issuer is in another namespace"
+      - "issuerRef.kind was left at its default, Issuer, so a namespaced Issuer is looked up"
+      - "The ClusterIssuer is not Ready"
+      - "dnsNames is empty"
+    answer: 1
+    explain: "kind defaults to Issuer; a ClusterIssuer must be referenced with kind: ClusterIssuer."
+  - q: "With rotationPolicy: Never, what happens to the private key at renewal?"
+    options:
+      - "A new key is generated"
+      - "The existing key in the Secret is reused"
+      - "Renewal fails"
+      - "The key is rotated only if the algorithm changed"
+    answer: 1
+    explain: "Never reuses the key; Always regenerates it on every issuance."
+  - q: "Which objects does an ACME issuance create after the CertificateRequest?"
+    options:
+      - "An Order and one Challenge per DNS name"
+      - "A Pod per DNS name"
+      - "A second Certificate"
+      - "None; the request is signed directly"
+    answer: 0
+    explain: "ACME needs domain validation; CA and self-signed issuers sign the request directly."

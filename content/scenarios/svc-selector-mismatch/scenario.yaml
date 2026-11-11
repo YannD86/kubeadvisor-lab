@@ -1,0 +1,43 @@
+id: svc-selector-mismatch
+title: "Service has no endpoints"
+realm: scenarios
+category: network
+type: troubleshoot
+difficulty: beginner
+estimated_minutes: 10
+tags: [service, endpoints, labels, selector]
+requires_addons: []
+summary: "The shop frontend Service answers with connection refused although all Pods are Running. Find out why the Service is empty."
+brief: |
+  **Ticket #4821 — P2 — shop frontend unreachable inside the cluster**
+
+  The checkout team reports that calls from their service to
+  `http://web.lab-shop.svc` fail with `connection refused`. They checked the
+  `web` Pods: all three are `Running` and `1/1 Ready`, logs look healthy, and
+  `kubectl port-forward` to a Pod works fine.
+
+  They suspect "something with networking" and asked us to look.
+
+  ## Your task
+  - Make `http://web` in namespace `lab-shop` return HTTP 200 from inside the cluster.
+  - Do not delete or relabel the Pods; the Deployment is owned by another team.
+namespace: lab-shop
+hints:
+  - "A Service does not know about Deployments. It only knows labels. What does `web` select, and what do the Pods carry?"
+  - "kubectl get endpointslices -n lab-shop -l kubernetes.io/service-name=web — an empty ENDPOINTS column (<unset>) means the selector matched nothing."
+  - "kubectl get pods -n lab-shop --show-labels, then kubectl get svc web -n lab-shop -o yaml | grep -A3 selector"
+  - "The fix is a one-line edit on the Service: kubectl edit svc web -n lab-shop (or patch it)."
+checks:
+  - name: "Service web has at least one endpoint"
+    cmd: test -n "$(kubectl get endpointslices -n lab-shop -l kubernetes.io/service-name=web -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].addresses[*]}')"
+  - name: "Pods still carry their original labels (fix the Service, not the Pods)"
+    cmd: test "$(kubectl get pods -n lab-shop -l app=web-frontend --no-headers 2>/dev/null | wc -l)" -ge 3
+  - name: "Deployment was not modified"
+    cmd: test "$(kubectl get deploy -n lab-shop web -o jsonpath='{.metadata.generation}')" = "1"
+  - name: "HTTP 200 from a Pod inside the cluster"
+    cmd: kubectl run -n lab-shop probe-$RANDOM --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- -s -o /dev/null -w '%{http_code}' --max-time 5 http://web | grep -q 200
+concepts:
+  - "A Service is a label selector plus port mapping. The Endpoints / EndpointSlice objects are the materialised result; if they are empty, the selector matched nothing."
+  - "kube-proxy installs a REJECT rule for a Service with zero ready endpoints, so clients get `connection refused` immediately. Timeouts point elsewhere: a NetworkPolicy drop, an unreachable Pod IP, or a container that never answers."
+  - "Pods Running is not the same as Pods selected. Always check labels from both sides."
+related_lessons: [troubleshooting/network-triage]

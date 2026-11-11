@@ -1,0 +1,293 @@
+id: kustomize-kustomization
+title: "kustomization.yaml: compose an overlay"
+kind: Kustomization
+apiVersion: kustomize.config.k8s.io/v1beta1
+realm: manifests
+track: flux
+difficulty: beginner
+estimated_minutes: 18
+summary: >
+  Write the kustomization.yaml of a dev overlay: base resources, a
+  namespace, labels that do not touch selectors, an image tag override, a
+  targeted patch and a generated ConfigMap, and learn what the name
+  suffix hash does to rollouts.
+intro: |
+  This is the **file**, not the Flux object. `kustomization.yaml`
+  (`kustomize.config.k8s.io/v1beta1`) is read by `kubectl kustomize`,
+  `kubectl apply -k` and by Flux's kustomize-controller when a
+  Kustomization's `spec.path` points at its directory. It is never sent to
+  the API server: there is no such resource, so it has no `metadata`, no
+  `status` and `kubectl apply -f kustomization.yaml` fails.
+
+  The file is a recipe: load `resources` (files, directories, URLs), then
+  apply transformers in a fixed internal order (patches first, then
+  namespace, name prefix, labels, images, replacements), then emit the
+  generated objects. Overlays
+  are just kustomizations whose `resources` include another kustomization
+  directory (`../../base`), which is how one base serves dev, staging and
+  prod.
+
+  The directory layout assumed here is the one the Flux Kustomization
+  builder reconciles: `deploy/base` and `deploy/overlays/dev`.
+prerequisites: []
+crd: false
+docs_url: https://kubectl.docs.kubernetes.io/references/kustomize/kustomization/
+steps:
+  - path: apiVersion
+    title: "API version of the file"
+    prompt: "Declare the kustomize file format."
+    why: |
+      `kustomize.config.k8s.io/v1beta1` is the schema kustomize uses to
+      parse the file. It has been `v1beta1` for years and is not an API
+      server group: `kubectl api-resources` does not list it. The header
+      is technically optional (kustomize infers it) but Flux, IDE schemas
+      and `kubectl kustomize` warnings all expect it, and it is what tells
+      a reader this is not the Flux CRD.
+    hint: "The group is kustomize.config.k8s.io and it never left beta."
+    expect: { type: equals, value: kustomize.config.k8s.io/v1beta1 }
+    reveal: "apiVersion: kustomize.config.k8s.io/v1beta1"
+    gotchas:
+      - "kustomize.toolkit.fluxcd.io/v1 here makes kustomize fail with 'unknown field' errors: that is the Flux object, not this file."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the document type."
+    why: |
+      Kustomize accepts exactly one `Kustomization` per directory, in a
+      file named `kustomization.yaml`, `kustomization.yml` or
+      `Kustomization`. A second kind, `Component`
+      (`kustomize.config.k8s.io/v1alpha1`), exists for reusable feature
+      fragments included through `components:`.
+    hint: "Same word as the Flux object; the apiVersion is what differs."
+    expect: { type: equals, value: Kustomization }
+    reveal: "kind: Kustomization"
+  - path: resources
+    title: "Resources"
+    prompt: "Include the base and any overlay-only manifests."
+    why: |
+      `resources` is the input list: plain manifest files, directories
+      that contain their own kustomization (the base) or remote URLs with
+      a ref. Paths are relative to this file and **cannot escape the
+      kustomization root** when loading files directly (`../secret.yaml`
+      is rejected; `../../base` works because it is a kustomization
+      directory). Order matters only for identical GVK+name collisions,
+      which are errors anyway.
+    hint: "A list of strings; the base lives two directories up."
+    expect: { type: list, value: { min_items: 1 } }
+    reveal: |
+      resources:
+        - ../../base
+        - hpa.yaml
+    gotchas:
+      - "A directory without kustomization.yaml is an error here; the Flux controller auto-generates one, plain kustomize does not."
+  - path: namespace
+    title: "Namespace transformer"
+    prompt: "Put every namespaced object into lab-podinfo."
+    why: |
+      Sets `metadata.namespace` on all namespaced resources, overriding
+      values already present, and rewrites namespace references kustomize
+      knows about (RoleBinding subjects, webhook configurations). It does
+      not create the Namespace object: add a `namespace.yaml` to
+      `resources` or rely on something else creating it. With Flux, a
+      `targetNamespace` on the Kustomization does the same job one level
+      up.
+    hint: "A single string; app namespaces in this lab are lab-*."
+    expect: { type: regex, value: "^lab-[a-z0-9-]+$" }
+    reveal: "namespace: lab-podinfo"
+  - path: labels
+    title: "Labels (without selectors)"
+    prompt: "Add environment labels to every object using the labels field."
+    why: |
+      `labels` replaces the deprecated `commonLabels`. The old field added
+      the labels to `spec.selector` and pod templates as well, which made
+      adding `env: dev` to a running Deployment impossible: selectors are
+      immutable, so the apply failed. Each `labels` entry carries its own
+      `pairs` and decides with `includeSelectors` and `includeTemplates`
+      whether to touch those fields. Metadata-only labels are safe to add
+      and remove at any time.
+    hint: "A list of maps; each item has pairs and selector flags."
+    expect: { type: list, value: { min_items: 1, item_keys: [pairs] } }
+    reveal: |
+      labels:
+        - pairs:
+            app.kubernetes.io/part-of: podinfo
+            env: dev
+          includeSelectors: false
+    gotchas:
+      - "commonLabels still works but kustomize warns; converting existing overlays must keep includeSelectors: true for labels already in selectors."
+  - path: labels[0].includeSelectors
+    title: "includeSelectors"
+    prompt: "Keep selectors untouched."
+    why: |
+      `includeSelectors: true` reproduces `commonLabels`: labels go into
+      `spec.selector.matchLabels`, `spec.template.metadata.labels`,
+      Service selectors and NetworkPolicy selectors. That is only correct
+      on the very first deploy; any later change rewrites an immutable
+      selector and the apply fails with `field is immutable`. Leave it
+      `false` for descriptive labels and let the base define the selector
+      labels once.
+    hint: "A boolean; think about what happens to spec.selector on the second apply."
+    expect: { type: boolean }
+    reveal: "includeSelectors: false"
+  - path: images
+    title: "Image override"
+    prompt: "Retag the podinfo image for this environment."
+    why: |
+      `images` rewrites container images by matching the **name part**
+      (registry/repository) of `image:` fields across all workloads,
+      replacing `newName`, `newTag` or `digest`. This is what CI and Flux
+      image automation edit: `kustomize edit set image
+      ghcr.io/stefanprodan/podinfo=...:6.7.1` changes this list, not the
+      Deployment, so the base stays environment-agnostic.
+    hint: "A list of maps with name and newTag; name is the image without a tag."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, newTag] } }
+    reveal: |
+      images:
+        - name: ghcr.io/stefanprodan/podinfo
+          newTag: 6.7.1
+  - path: images[0].newTag
+    title: "The tag itself"
+    prompt: "Pin a concrete tag."
+    why: |
+      The tag is a string. A tag that looks like a number (`1.0`, `2024`)
+      must be quoted or YAML turns it into a float or integer and kustomize
+      rejects the type. Prefer `digest: sha256:...` for immutability when
+      your pipeline resolves digests; `newTag` and `digest` can be
+      combined and the digest wins.
+    hint: "Anything but latest; quote numeric-looking tags."
+    expect: { type: regex, value: "^(?!latest$)[A-Za-z0-9._-]+$" }
+    reveal: "newTag: 6.7.1"
+    gotchas:
+      - "newTag: 1.0 without quotes becomes the float 1.0 and fails with 'expected string'."
+  - path: patches
+    title: "Patches"
+    prompt: "Patch the Deployment's replica count with a JSON 6902 patch."
+    why: |
+      `patches` is the unified field (replacing `patchesStrategicMerge` and
+      `patchesJson6902`). Each item is either `path` (a file) or an inline
+      `patch`, plus an optional `target`. Strategic-merge patches carry
+      their own GVK and name, so `target` can be omitted; JSON 6902
+      patches (`op`, `path`, `value`) have no identity and **require**
+      `target`. Patches run **before** `namespace` and `images`, so a
+      patch sees the untransformed object and cannot rely on the namespace
+      or image having been rewritten (use `replacements` or patch the
+      final value yourself).
+    hint: "A list of maps with target and patch; the patch value is a multi-line string."
+    expect: { type: list, value: { min_items: 1, item_keys: [target, patch] } }
+    reveal: |
+      patches:
+        - target:
+            kind: Deployment
+            name: podinfo
+          patch: |
+            - op: replace
+              path: /spec/replicas
+              value: 2
+    gotchas:
+      - "A 6902 'replace' on a path that does not exist fails; use 'add' when the field may be absent."
+  - path: patches[0].target.kind
+    title: "Patch target"
+    prompt: "Target the Deployment kind."
+    why: |
+      `target` selects objects by any combination of `group`, `version`,
+      `kind`, `name`, `namespace`, `labelSelector` and
+      `annotationSelector`. A target with only `kind: Deployment` patches
+      **every** Deployment in the build, which is intended for
+      cross-cutting changes (add a sidecar everywhere) and a surprise for
+      everything else. Name is a regex: `name: podinfo.*` matches
+      `podinfo-cache` too.
+    hint: "The CamelCase kind; add name to limit the blast radius."
+    expect: { type: equals, value: Deployment }
+    reveal: |
+      target:
+        kind: Deployment
+        name: podinfo
+  - path: configMapGenerator
+    title: "ConfigMap generator"
+    prompt: "Generate a ConfigMap from literals."
+    why: |
+      Generators build ConfigMaps and Secrets from `literals`, `files` or
+      `envs` at build time and append a **content hash** to the name
+      (`podinfo-config-7g2h8k4m9b`). Kustomize then rewrites every
+      reference to `podinfo-config` in pod specs. The point: changing a
+      literal changes the name, which changes the pod template, which
+      triggers a rollout. Writing the ConfigMap by hand gives you none of
+      that.
+    hint: "A list of maps with name and literals."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, literals] } }
+    reveal: |
+      configMapGenerator:
+        - name: podinfo-config
+          literals:
+            - PODINFO_UI_COLOR=#34577c
+            - PODINFO_UI_MESSAGE=dev overlay
+    gotchas:
+      - "With Flux pruning, the previous hashed ConfigMap is deleted once the new one is applied; a kubectl rollout undo then starts Pods that reference a missing ConfigMap."
+  - path: generatorOptions.disableNameSuffixHash
+    title: "Name suffix hash"
+    prompt: "Decide whether generated names carry the content hash."
+    why: |
+      `disableNameSuffixHash: true` gives generated objects their plain
+      name. You need it when something outside this build references the
+      ConfigMap by name (a HelmRelease `valuesFrom`, an operator, a Pod in
+      another kustomization), but you lose the automatic rollout: Pods keep
+      the old file until restarted or until a reloader annotation does it
+      for you. Keeping the hash (the default, written explicitly here) is
+      the safer choice when all consumers are in the same build.
+    hint: "A boolean under generatorOptions; think about who references the name."
+    expect: { type: boolean }
+    reveal: |
+      generatorOptions:
+        disableNameSuffixHash: false
+    gotchas:
+      - "Per-generator options (configMapGenerator[].options.disableNameSuffixHash) override the global ones."
+final_manifest: |
+  apiVersion: kustomize.config.k8s.io/v1beta1
+  kind: Kustomization
+  resources:
+    - ../../base
+    - hpa.yaml
+  namespace: lab-podinfo
+  labels:
+    - pairs:
+        app.kubernetes.io/part-of: podinfo
+        env: dev
+      includeSelectors: false
+  images:
+    - name: ghcr.io/stefanprodan/podinfo
+      newTag: 6.7.1
+  patches:
+    - target:
+        kind: Deployment
+        name: podinfo
+      patch: |
+        - op: replace
+          path: /spec/replicas
+          value: 2
+  configMapGenerator:
+    - name: podinfo-config
+      literals:
+        - PODINFO_UI_COLOR=#34577c
+        - PODINFO_UI_MESSAGE=dev overlay
+  generatorOptions:
+    disableNameSuffixHash: false
+quiz:
+  - q: "You add env: dev through commonLabels to an overlay already deployed in production and apply. What happens?"
+    options:
+      - "Labels are added to all objects"
+      - "The apply fails: commonLabels also rewrites immutable selectors"
+      - "Only Pods are relabelled"
+      - "Kustomize ignores labels on existing objects"
+    answer: 1
+    explain: "commonLabels (and labels with includeSelectors: true) modify spec.selector, which is immutable on Deployments."
+  - q: "What triggers a rollout when you change a literal in configMapGenerator?"
+    options:
+      - "Kustomize restarts the Pods"
+      - "The ConfigMap name changes (hash suffix), so the pod template changes"
+      - "The kubelet watches ConfigMaps"
+      - "Nothing; ConfigMap changes never trigger rollouts"
+    answer: 1
+    explain: "The hash suffix is the mechanism; disableNameSuffixHash removes it."
+  - q: "Which patch form requires a target?"
+    options: ["Strategic merge patch with its own metadata.name", "JSON 6902 patch", "Both", "Neither"]
+    answer: 1
+    explain: "A 6902 patch is a list of operations with no identity, so the target supplies it."

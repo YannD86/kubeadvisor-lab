@@ -1,0 +1,387 @@
+id: flux-helmrelease
+title: "Flux HelmRelease: a Helm release managed by a controller"
+kind: HelmRelease
+apiVersion: helm.toolkit.fluxcd.io/v2
+realm: manifests
+track: flux
+difficulty: intermediate
+estimated_minutes: 25
+summary: >
+  Build a HelmRelease that installs podinfo from the HelmRepository into
+  lab-podinfo, with a semver range, remediation that actually retries,
+  inline values and values from a ConfigMap, and learn where
+  helm-controller stores the release and why its defaults surprise people.
+intro: |
+  A `HelmRelease` is `helm install`/`helm upgrade` turned into a
+  reconciled object. `helm-controller` reads it, asks source-controller for
+  the chart (by creating a `HelmChart` named `<namespace>-<name>` in the
+  source's namespace), merges `valuesFrom` then `values`, and runs the
+  Helm SDK: **install** on first sight, **upgrade** when the chart
+  version, the values or the chart contents change, **test** if enabled,
+  and **remediation** (rollback or uninstall) when an action fails.
+
+  Three things differ from the CLI. The release is stored by Helm in
+  Secrets `sh.helm.release.v1.<release>.v<N>` in `storageNamespace`, which
+  is *not* the target namespace by default. Failures do not retry unless
+  you configure `remediation.retries`; a failed upgrade with zero retries
+  sits there until the spec changes. And `interval` alone does not repair
+  manual edits to the released objects: that needs
+  `driftDetection.mode: enabled`, which re-applies the rendered manifest
+  on every interval without a Helm upgrade.
+prerequisites: [flux-helmrepository]
+crd: true
+docs_url: https://fluxcd.io/flux/components/helm/helmreleases/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the helm-controller API."
+    why: |
+      HelmRelease is served by `helm-controller` under
+      `helm.toolkit.fluxcd.io`. `v2` is the stable version introduced in
+      Flux 2.3 and the only one still served: `v2beta1` was removed from the
+      CRD in Flux 2.7 and `v2beta2` in Flux 2.8, so beta manifests must be
+      migrated (`flux migrate`). `v2` removed deprecated fields (for example
+      `spec.chart.spec.valuesFile`) and renamed the drift and remediation
+      knobs. New manifests must use `v2`.
+    hint: "Not the source group: this one is helm.toolkit.fluxcd.io, stable version v2."
+    expect: { type: equals, value: helm.toolkit.fluxcd.io/v2 }
+    reveal: "apiVersion: helm.toolkit.fluxcd.io/v2"
+    gotchas:
+      - "v2beta1 is no longer served; when migrating an old manifest to v2, replace spec.chart.spec.valuesFile with valuesFiles (plural): v2 dropped the singular field."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      One HelmRelease is exactly one Helm release: one name, one storage
+      history, one set of values. If you need the same chart twice
+      (two Redis instances), you need two HelmRelease objects with
+      different `releaseName`s, never one object with duplicated values.
+    hint: "CamelCase, singular."
+    expect: { type: equals, value: HelmRelease }
+    reveal: "kind: HelmRelease"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the HelmRelease."
+    why: |
+      The object name is used in three derived names: the default
+      `releaseName`, the generated `HelmChart`
+      (`flux-system-podinfo` here) and the events you will read with
+      `flux events --for HelmRelease/podinfo`. Keep it equal to the chart
+      or the app name unless you install the chart more than once.
+    hint: "Lowercase DNS label."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: podinfo
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Keep the HelmRelease with the other Flux objects."
+    why: |
+      The HelmRelease namespace is the default for `targetNamespace`,
+      `storageNamespace`, `chart.spec.sourceRef.namespace` and the
+      namespace in which `valuesFrom` ConfigMaps and Secrets are looked
+      up. Every one of those defaults is overridable, and this builder
+      overrides most of them so that the release lands in `lab-podinfo`
+      while the control object stays in `flux-system`.
+    hint: "The namespace Flux was installed in."
+    expect: { type: equals, value: flux-system }
+    reveal: "  namespace: flux-system"
+  - path: spec.interval
+    title: "Interval"
+    prompt: "Set how often helm-controller re-evaluates the release."
+    why: |
+      On each tick the controller compares the desired release (chart
+      digest + merged values) with the last successful one and only runs a
+      Helm action when they differ, so a 30m interval is cheap. Chart
+      updates and ConfigMap changes are also picked up immediately through
+      watches. The interval is **not** drift correction: Helm does not look
+      at the live objects unless `driftDetection` is enabled.
+    hint: "Go duration; 30m to 1h is common for releases."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: |
+      spec:
+        interval: 30m
+    gotchas:
+      - "Someone runs kubectl scale on the released Deployment: without driftDetection.mode: enabled, Flux never notices."
+  - path: spec.releaseName
+    title: "Release name"
+    prompt: "Pin the Helm release name."
+    why: |
+      When omitted, the release name is `<targetNamespace>-<name>` if a
+      `targetNamespace` is set, otherwise `<name>`. That makes `helm list`
+      show `lab-podinfo-podinfo`, and the chart's full-name helper then
+      prefixes every object with it. Setting `releaseName` explicitly
+      keeps object names predictable. Helm stores history under this name,
+      so treat it as immutable: changing it creates a brand-new release
+      and orphans the old one.
+    hint: "What helm list should show; same as the app name here."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "releaseName: podinfo"
+  - path: spec.targetNamespace
+    title: "Target namespace"
+    prompt: "Install the chart's objects into lab-podinfo."
+    why: |
+      `targetNamespace` is passed to Helm as `--namespace`: it is where the
+      rendered objects go. It does **not** move Helm's own storage, which
+      stays in `storageNamespace` (default: the HelmRelease namespace), so
+      `helm list -n lab-podinfo` returns nothing while the release is
+      alive in `flux-system`. Set `storageNamespace` to the same value when
+      humans will use the Helm CLI to inspect or roll back.
+    hint: "App namespaces are lab-*; consider aligning storageNamespace."
+    expect: { type: regex, value: "^lab-[a-z0-9-]+$" }
+    reveal: |
+      targetNamespace: lab-podinfo
+      storageNamespace: lab-podinfo
+    gotchas:
+      - "helm list -A shows the release under storageNamespace, which is why 'helm says it is not installed' is usually a namespace confusion."
+  - path: spec.chart.spec.chart
+    title: "Chart name"
+    prompt: "Name the chart inside the repository."
+    why: |
+      For a HelmRepository source this is the chart name as it appears in
+      `index.yaml`. For a GitRepository source it is a *path* to the
+      directory containing `Chart.yaml` (e.g. `./charts/podinfo`). The
+      value is copied into the generated `HelmChart` object; when the chart
+      is missing from the index the HelmChart reports
+      `no chart name/version found`, and the HelmRelease shows
+      `ArtifactFailed`.
+    hint: "The chart's name in index.yaml, not a URL."
+    expect: { type: regex, value: "^[A-Za-z0-9./_-]+$" }
+    reveal: |
+      chart:
+        spec:
+          chart: podinfo
+  - path: spec.chart.spec.version
+    title: "Version constraint"
+    prompt: "Accept any 6.x release of the chart."
+    why: |
+      `version` is a semver **range**, resolved by source-controller
+      against the index on every `chart.spec.interval`. `6.x` means
+      helm-controller will upgrade automatically when `6.8.0` is published,
+      which is either continuous delivery or an unreviewed production
+      change depending on your point of view. Pin an exact version for
+      anything you want to promote through environments; use ranges where
+      you deliberately trust upstream patch releases.
+    hint: "Quote it; a range like 6.x or >=6.7.0 <7.0.0 is valid."
+    expect: { type: regex, value: "^[~^>=<! ,0-9.xX*-]+$" }
+    reveal: "version: \"6.x\""
+    gotchas:
+      - "An unquoted 6.7 is parsed as the float 6.7 and the CRD rejects it: version must be a string."
+      - "Omitting version means '*': the newest version, including a future major with breaking values."
+  - path: spec.chart.spec.sourceRef.kind
+    title: "Source reference"
+    prompt: "Reference the podinfo HelmRepository."
+    why: |
+      `sourceRef` tells source-controller which source to resolve the
+      chart from: `HelmRepository`, `GitRepository` or `Bucket`. The pair
+      kind+name is written into the generated HelmChart. With an
+      `OCIRepository` that already points at a chart you would use
+      `spec.chartRef` instead of `spec.chart` entirely.
+    hint: "kind of the source you built previously, plus its name."
+    expect: { type: oneOf, value: [HelmRepository, GitRepository, Bucket] }
+    reveal: |
+      sourceRef:
+        kind: HelmRepository
+        name: podinfo
+  - path: spec.chart.spec.sourceRef.namespace
+    title: "Source namespace"
+    prompt: "State where the HelmRepository lives."
+    why: |
+      Defaults to the HelmRelease namespace. Because the generated
+      HelmChart is created in the **source's** namespace, the controller
+      needs this to be right before anything else happens; a wrong value
+      yields `HelmRepository/lab-podinfo/podinfo not found` on the
+      HelmChart, not on the HelmRelease, which sends people looking in the
+      wrong object.
+    hint: "Where you created the HelmRepository."
+    expect: { type: equals, value: flux-system }
+    reveal: "namespace: flux-system"
+    gotchas:
+      - "Cross-namespace chart references can be disabled cluster-wide with --no-cross-namespace-refs on helm-controller."
+  - path: spec.chart.spec.interval
+    title: "Chart interval"
+    prompt: "Set how often the version range is re-resolved."
+    why: |
+      This is the HelmChart's own interval: how often source-controller
+      re-reads the repository index and checks whether a newer version
+      matches the range. When omitted it inherits the HelmRelease
+      `interval`. With an exact version pin this interval only matters for
+      chart contents changing under the same version, which registries
+      forbid but some HTTP repos allow.
+    hint: "Go duration; with a range it is your auto-upgrade cadence."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: "interval: 12h"
+  - path: spec.install.createNamespace
+    title: "Create the namespace on install"
+    prompt: "Let the first install create lab-podinfo if it is missing."
+    why: |
+      Equivalent to `helm install --create-namespace`. helm-controller
+      creates the `targetNamespace` before rendering, but the namespace is
+      not part of the release: it is not labelled, not managed and not
+      removed on uninstall. In a GitOps repo you usually prefer a
+      Kustomization that owns namespaces and `dependsOn` it; this flag is
+      the pragmatic alternative for standalone releases.
+    hint: "A boolean under spec.install."
+    expect: { type: boolean }
+    reveal: |
+      install:
+        createNamespace: true
+  - path: spec.install.remediation.retries
+    title: "Install remediation"
+    prompt: "Retry a failed install up to 3 times."
+    why: |
+      The default is `0`: a failed `helm install` (hook timeout, bad
+      values, missing CRD) leaves the release in `failed` state and the
+      HelmRelease marked `InstallFailed` with retries exhausted. Nothing
+      happens until the spec changes or you run
+      `flux reconcile hr podinfo --reset`. With `retries: 3` the controller
+      uninstalls the failed release (the only install remediation
+      strategy) and tries again; `-1` retries forever.
+    hint: "An integer under install.remediation; 0 is the default and means give up."
+    expect: { type: integer }
+    reveal: |
+      remediation:
+        retries: 3
+    gotchas:
+      - "Remediation of an install is an uninstall, so PVCs created by the chart with a Delete reclaim policy are gone on the second try."
+  - path: spec.upgrade.remediation.retries
+    title: "Upgrade remediation"
+    prompt: "Retry a failed upgrade up to 3 times."
+    why: |
+      Same default trap on upgrades: `0` retries means a failed upgrade
+      leaves Helm's history on a `failed` revision while the *previous*
+      objects may still be running, and the HelmRelease stays
+      `UpgradeFailed`. With retries, the controller applies `strategy`
+      (`rollback`, the default, or `uninstall`) and re-attempts. Scenario
+      `helm-upgrade-failed-rollback` walks through the resulting history.
+    hint: "An integer under upgrade.remediation."
+    expect: { type: integer }
+    reveal: |
+      upgrade:
+        remediation:
+          retries: 3
+          strategy: rollback
+  - path: spec.upgrade.remediation.remediateLastFailure
+    title: "Remediate the last failure"
+    prompt: "Roll back even when retries are exhausted."
+    why: |
+      Retries govern re-attempts, not the final state. After the last
+      failed attempt, `remediateLastFailure: true` performs one more
+      rollback so the cluster ends on the last good revision instead of a
+      half-applied one. For upgrades it already defaults to `true` whenever
+      `retries` is greater than zero (as here), so writing it is
+      documentation; with `retries: 0` it defaults to `false`. For installs
+      the same field defaults to `false` regardless of `retries`.
+    hint: "A boolean next to retries."
+    expect: { type: boolean }
+    reveal: "remediateLastFailure: true"
+    gotchas:
+      - "Rolling back does not fix the manifest: the HelmRelease keeps reporting the failure until Git changes."
+  - path: spec.values.replicaCount
+    title: "Inline values"
+    prompt: "Set replicaCount and resource requests for the chart."
+    why: |
+      `values` is the chart's `values.yaml` override, merged **last** so it
+      wins over everything in `valuesFrom`. Keys must match what the chart
+      templates read: a typo (`replicas` instead of `replicaCount`) is
+      silently ignored by Helm. Put environment-independent choices here
+      and environment-specific ones in `valuesFrom`, so the same
+      HelmRelease can be reused across clusters.
+    hint: "A free-form map; the podinfo chart reads replicaCount and resources."
+    expect: { type: integer }
+    reveal: |
+      values:
+        replicaCount: 2
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+    gotchas:
+      - "A values key the chart does not know is not an error (scenario flux-helmrelease-values-error shows what a wrong type does)."
+  - path: spec.valuesFrom
+    title: "Values from a ConfigMap"
+    prompt: "Layer values from a ConfigMap named podinfo-values."
+    why: |
+      Each entry references a ConfigMap or Secret **in the HelmRelease
+      namespace**, reads `valuesKey` (default `values.yaml`) and merges it
+      in list order, before `spec.values`. `targetPath` injects a single
+      value at a dotted path instead of a whole file, which is how you feed
+      a Secret into `ingress.tls[0].secretName`. A missing source blocks
+      the release unless `optional: true`, and changes to the referenced
+      object trigger an upgrade.
+    hint: "A list of maps with kind and name; optional avoids a hard dependency."
+    expect: { type: list, value: { min_items: 1, item_keys: [kind, name] } }
+    reveal: |
+      valuesFrom:
+        - kind: ConfigMap
+          name: podinfo-values
+          valuesKey: values.yaml
+          optional: true
+    gotchas:
+      - "The ConfigMap must be in flux-system here, not in lab-podinfo."
+final_manifest: |
+  apiVersion: helm.toolkit.fluxcd.io/v2
+  kind: HelmRelease
+  metadata:
+    name: podinfo
+    namespace: flux-system
+  spec:
+    interval: 30m
+    releaseName: podinfo
+    targetNamespace: lab-podinfo
+    storageNamespace: lab-podinfo
+    chart:
+      spec:
+        chart: podinfo
+        version: "6.x"
+        sourceRef:
+          kind: HelmRepository
+          name: podinfo
+          namespace: flux-system
+        interval: 12h
+    install:
+      createNamespace: true
+      remediation:
+        retries: 3
+    upgrade:
+      remediation:
+        retries: 3
+        strategy: rollback
+        remediateLastFailure: true
+    driftDetection:
+      mode: enabled
+    values:
+      replicaCount: 2
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 128Mi
+    valuesFrom:
+      - kind: ConfigMap
+        name: podinfo-values
+        valuesKey: values.yaml
+        optional: true
+apply:
+  mode: dry-run
+  requires_addons: [flux]
+quiz:
+  - q: "The HelmRelease is in flux-system with targetNamespace lab-podinfo and no storageNamespace. Where does helm list find the release?"
+    options: ["lab-podinfo", "flux-system", "Both", "Nowhere: Flux does not use Helm storage"]
+    answer: 1
+    explain: "storageNamespace defaults to the HelmRelease namespace, independently of targetNamespace."
+  - q: "An upgrade fails with the default remediation settings. What is the state afterwards?"
+    options:
+      - "Helm rolled back automatically"
+      - "The release is uninstalled"
+      - "The failed revision stays; the HelmRelease is UpgradeFailed until the spec changes or you reset it"
+      - "The controller retries every interval"
+    answer: 2
+    explain: "retries defaults to 0 and remediateLastFailure to false; nothing retries until a new generation or a --reset."
+  - q: "A key appears in both a valuesFrom ConfigMap and spec.values. Which wins?"
+    options: ["valuesFrom", "spec.values", "The chart default", "It is a validation error"]
+    answer: 1
+    explain: "valuesFrom entries are merged in order first, then spec.values is applied on top."

@@ -1,0 +1,49 @@
+id: rbac-forbidden-list-pods
+title: "ServiceAccount gets 403 listing Pods"
+realm: scenarios
+category: rbac
+type: troubleshoot
+difficulty: intermediate
+estimated_minutes: 15
+tags: [rbac, serviceaccount, role, rolebinding, forbidden]
+requires_addons: []
+summary: "The pod-watcher in lab-rbac polls the API every 10 seconds and gets 403 Forbidden on every call, although a Role granting read access exists. Find the broken link in the RBAC chain and fix it without over-granting."
+brief: |
+  **Ticket #5203 — P3 — pod-watcher gets 403 from the API server**
+
+  The observability team runs a small `pod-watcher` Deployment in namespace
+  `lab-rbac`. Every 10 seconds it calls
+  `GET /api/v1/namespaces/lab-rbac/pods` with its ServiceAccount token and
+  logs the HTTP status. Since it was deployed, every line says `403`.
+
+  They created a Role `pod-reader` that allows `get`, `list` and `watch` on
+  pods, and a RoleBinding for it, "exactly like the Kubernetes docs". They
+  ask whether RBAC is disabled on this cluster or whether they need
+  `cluster-admin`.
+
+  ## Your task
+  - `kubectl auth can-i list pods -n lab-rbac --as=system:serviceaccount:lab-rbac:pod-watcher` answers `yes`.
+  - The latest `pod-watcher` log line shows `HTTP 200`, and the Deployment keeps running as the `pod-watcher` ServiceAccount.
+  - Least privilege: the ServiceAccount must not be able to delete pods, and must not be bound to `cluster-admin` (or any ClusterRole granting `*`).
+namespace: lab-rbac
+hints:
+  - "Read the 403 body in the logs: it names the exact subject, verb, resource and namespace being refused. kubectl logs -n lab-rbac deploy/pod-watcher --tail=4"
+  - "Test the chain from the outside: kubectl auth can-i list pods -n lab-rbac --as=system:serviceaccount:lab-rbac:pod-watcher. Then check each link: ServiceAccount -> RoleBinding subjects -> roleRef -> Role rules."
+  - "kubectl describe rolebinding -n lab-rbac: compare the Subjects line with kubectl get sa -n lab-rbac. A binding to a ServiceAccount that does not exist is valid YAML and grants nothing."
+  - "Fix the subject name on the RoleBinding (kubectl edit rolebinding pod-watcher-binding -n lab-rbac). RBAC changes apply immediately; the next poll (10s) should log 200."
+checks:
+  - name: "pod-watcher SA can list pods in lab-rbac"
+    cmd: test "$(kubectl auth can-i list pods -n lab-rbac --as=system:serviceaccount:lab-rbac:pod-watcher 2>/dev/null)" = "yes"
+  - name: "Latest pod-watcher log line shows HTTP 200"
+    cmd: for i in 1 2 3 4 5 6 7 8; do kubectl logs -n lab-rbac deploy/pod-watcher --tail=1 2>/dev/null | grep -q 'HTTP 200' && exit 0; sleep 2; done; exit 1
+  - name: "Deployment still runs as ServiceAccount pod-watcher"
+    cmd: test "$(kubectl get deploy -n lab-rbac pod-watcher -o jsonpath='{.spec.template.spec.serviceAccountName}')" = "pod-watcher"
+  - name: "Least privilege: the SA cannot delete pods"
+    cmd: test "$(kubectl auth can-i delete pods -n lab-rbac --as=system:serviceaccount:lab-rbac:pod-watcher 2>/dev/null)" = "no"
+  - name: "The SA is not cluster-admin (no wildcard grant)"
+    cmd: test "$(kubectl auth can-i '*' '*' --as=system:serviceaccount:lab-rbac:pod-watcher 2>/dev/null)" = "no"
+concepts:
+  - "RBAC is a chain: identity (ServiceAccount) -> RoleBinding.subjects -> RoleBinding.roleRef -> Role.rules. A typo anywhere breaks it silently: bindings to non-existent subjects are accepted and grant nothing."
+  - "`kubectl auth can-i <verb> <resource> --as=system:serviceaccount:<ns>:<name>` tests the chain exactly as the API server evaluates it; use it before and after every RBAC change."
+  - "A 403 body is precise: `User \"system:serviceaccount:lab-rbac:pod-watcher\" cannot list resource \"pods\" in API group \"\" in the namespace \"lab-rbac\"`. Fix the missing grant, never reach for cluster-admin."
+related_lessons: [troubleshooting/storage-and-rbac-triage]

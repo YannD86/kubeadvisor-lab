@@ -1,0 +1,207 @@
+id: custom-resource-instance
+title: "Backup: write an instance of your own kind"
+kind: Backup
+apiVersion: sre.lab/v1
+realm: manifests
+track: crd
+difficulty: intermediate
+estimated_minutes: 12
+summary: >
+  Create a Backup object against the CRD from crd-definition and see the
+  schema act: the API server validates and defaults it, prunes what it does
+  not know, and a controller picks it up through a watch. Learn where the
+  boundary between the user's spec and the controller's status lies.
+intro: |
+  Once `backups.sre.lab` exists, `kind: Backup` is a first-class citizen:
+  `kubectl get bk`, RBAC on `backups`, namespace quotas, `kubectl explain
+  backup.spec`, all of it works from the CRD alone.
+
+  Writing an instance is where you feel the schema. The API server validates
+  the object at admission against the schema of the version named in the
+  request's `apiVersion`, applies `default:` values, prunes unknown fields,
+  converts it to the **storage version** and persists it. A controller
+  (whatever implements Backup) has a **watch** open on
+  `/apis/sre.lab/v1/backups?watch=true`, receives the ADDED event, reads
+  `spec`, does the work, and reports back through the `/status` subresource.
+  You never write `status`. If you do, the main endpoint ignores it, and if
+  you fight the controller through `/status`, you lose on the next
+  reconcile.
+
+  There is no Apply button on this builder: the lab cluster does not ship
+  this CRD. Build the CRD first, apply it from the terminal, then this file.
+prerequisites: [crd-definition]
+crd: true
+docs_url: https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the group and version of the CRD you defined."
+    why: |
+      `<spec.group>/<spec.versions[].name>` from the CRD. The API server only
+      routes versions whose `served` flag is true; naming an unserved or
+      undefined version yields `no matches for kind "Backup" in version
+      "sre.lab/v2"`, which is the same error you get when the CRD is not
+      installed at all. The object will be stored in the storage version
+      whatever you write here.
+    hint: "Group from spec.group, version from spec.versions[0].name of the CRD."
+    expect: { type: equals, value: sre.lab/v1 }
+    reveal: "apiVersion: sre.lab/v1"
+    gotchas:
+      - "`no matches for kind` means discovery has no such GVK: CRD missing, version not served, or a typo in the group."
+  - path: kind
+    title: "Kind"
+    prompt: "Declare the kind."
+    why: |
+      This must be `spec.names.kind` from the CRD, case-sensitive. The
+      resource name (`backups`) never appears in a manifest; it is the kind
+      that the API server maps to the REST path through discovery. kubectl
+      caches that discovery data (`~/.kube/cache`), which is why a freshly
+      created CRD sometimes needs a moment, or a cache flush, before
+      `kubectl apply` of an instance stops failing.
+    hint: "Exactly spec.names.kind from the CRD, CamelCase."
+    expect: { type: equals, value: Backup }
+    reveal: "kind: Backup"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the Backup."
+    why: |
+      Names of custom resources always follow the DNS subdomain rule; a CRD
+      cannot change it. The controller will typically derive child objects
+      from it (a CronJob `shop-db-nightly`, VolumeSnapshots
+      `shop-db-nightly-<timestamp>`) and set `ownerReferences` back to this
+      object so that deleting the Backup garbage-collects them. Choose a name
+      that still makes sense as a prefix.
+    hint: "Lowercase DNS name; it becomes the prefix of everything the controller creates."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: shop-db-nightly
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place the Backup in the namespace of the data it protects."
+    why: |
+      The CRD declared `scope: Namespaced`, so the object must have a
+      namespace and its RBAC is evaluated there. This is also the trust
+      boundary: the schema deliberately has no `target.namespace`, so a
+      Backup can only reference a PVC in its own namespace. A tenant who can
+      create Backups cannot point one at another team's volume, and the
+      controller does not have to implement that check itself.
+    hint: "A lab-* namespace, the same one as the PVC you will target."
+    expect: { type: regex, value: "^lab-[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+    gotchas:
+      - "Omitting the namespace on a Namespaced kind does not error: the object lands in your current context's namespace."
+  - path: metadata.labels.app
+    title: "Labels"
+    prompt: "Label the Backup with the application it belongs to."
+    why: |
+      Custom resources get labels for the same reasons built-ins do, plus
+      one: controllers often watch with a label selector to shard work or to
+      opt objects in (`backup.sre.lab/enabled: "true"`). Labels are also the
+      only way to list across kinds: `kubectl get bk,pvc,deploy -l app=shop-db`
+      shows the whole data stack of one app.
+    hint: "metadata.labels map; the app this volume belongs to."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      labels:
+        app: shop-db
+  - path: spec.schedule
+    title: "Schedule"
+    prompt: "Set a five-field cron schedule."
+    why: |
+      The CRD's `pattern` validates this at admission: a four-field or
+      `@daily` value is rejected with a 422 before any controller runs. Cron
+      strings need quotes in YAML when they start with `*`, because an
+      unquoted `*` is an alias indicator and the parser fails on it. The
+      time zone is whatever the controller runs in unless the schema offers
+      a `timeZone` field; assume UTC.
+    hint: "Five whitespace-separated fields, quoted. Pick a time outside business hours."
+    expect: { type: regex, value: '^(\S+\s+){4}\S+$' }
+    reveal: |
+      spec:
+        schedule: "0 2 * * *"
+    gotchas:
+      - "`schedule: * * * * *` unquoted is a YAML parse error, not a validation error; it never reaches the API server."
+  - path: spec.retention
+    title: "Retention"
+    prompt: "Keep a number of backups."
+    why: |
+      The schema says `type: integer, minimum: 1`. Writing `"7"` is a type
+      error (string), `0` fails the minimum, and omitting the field is fine
+      because the CRD declares `default: 7`: the API server fills it in at
+      admission and you will see the value when you `kubectl get -o yaml`
+      the object back, even though you never wrote it. Defaults live in the
+      stored object, not in the controller.
+    hint: "A bare integer, not a quoted string. Must satisfy the schema's minimum."
+    expect: { type: integer }
+    reveal: "retention: 7"
+  - path: spec.target.pvcName
+    title: "Target volume"
+    prompt: "Name the PersistentVolumeClaim to back up."
+    why: |
+      A reference by name, resolved by the controller in the Backup's own
+      namespace. The schema marks `target` and `pvcName` required and
+      `minLength: 1`, so an empty string is rejected too. What the schema
+      cannot do is check that the PVC exists: that is the controller's job,
+      and a good one reports `status.phase: Failed` with a message rather
+      than retrying silently. Existence checks belong in status, not in
+      admission, because the PVC may legitimately be created later.
+    hint: "spec.target is an object; pvcName is a plain string naming a PVC in this namespace."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: |
+      target:
+        pvcName: shop-db-data
+    gotchas:
+      - "A field the schema does not declare (target.namespace, for instance) is rejected by kubectl's default strict validation (unknown field); a controller or kubectl --validate=false gets it pruned silently: the object is accepted and the field is gone."
+  - path: spec.suspend
+    title: "Suspend switch"
+    prompt: "Add the suspend flag, explicitly off."
+    why: |
+      The pattern copied from CronJob and Flux: a boolean the controller
+      checks at the top of every reconcile and, if true, returns without
+      acting while leaving the object, its history and its status in place.
+      It is how you pause a backup during a migration without deleting it
+      and losing retention bookkeeping. The schema types it as boolean, so
+      `"false"` in quotes is rejected as a string.
+    hint: "A bare boolean under spec. Quoting it changes its type."
+    expect: { type: boolean }
+    reveal: "suspend: false"
+final_manifest: |
+  apiVersion: sre.lab/v1
+  kind: Backup
+  metadata:
+    name: shop-db-nightly
+    namespace: lab-build
+    labels:
+      app: shop-db
+  spec:
+    schedule: "0 2 * * *"
+    retention: 7
+    target:
+      pvcName: shop-db-data
+    suspend: false
+quiz:
+  - q: "You apply a Backup with spec.retention: \"7\" (quoted). What happens?"
+    options:
+      - "Accepted; strings are coerced to integers"
+      - "Rejected at admission: the schema says type integer"
+      - "Accepted; the controller converts it"
+      - "Accepted and pruned"
+    answer: 1
+    explain: "Schema validation runs in the API server before storage. A quoted number is a string and fails type: integer."
+  - q: "kubectl apply -f backup.yaml fails with: no matches for kind \"Backup\" in version \"sre.lab/v1\". Most likely cause?"
+    options:
+      - "The namespace does not exist"
+      - "The CRD is not installed, or that version is not served"
+      - "RBAC denies create on backups"
+      - "The schedule pattern did not match"
+    answer: 1
+    explain: "That error comes from discovery: the API server has no such GVK. Schema and RBAC errors come later and look different."
+  - q: "You write status.phase: Succeeded in the manifest and apply it. What does kubectl get -o yaml show?"
+    options:
+      - "status.phase: Succeeded"
+      - "Whatever the controller last wrote; the main endpoint ignores status when the subresource is enabled"
+      - "A validation error"
+      - "An empty status forever"
+    answer: 1
+    explain: "With subresources.status, status changes are only accepted on /status, which is the controller's endpoint."

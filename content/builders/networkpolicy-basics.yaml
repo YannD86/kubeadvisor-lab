@@ -1,0 +1,380 @@
+id: networkpolicy-basics
+title: "NetworkPolicy: a firewall written in labels"
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+realm: manifests
+track: networking
+difficulty: intermediate
+estimated_minutes: 20
+summary: >
+  Lock down the api Pods of lab-build: allow ingress only from the frontend
+  and from Prometheus in its own namespace, allow egress only to DNS and
+  Redis. Learn the AND/OR semantics of peers, why policyTypes decides what
+  default-deny means, and why nothing happens without a CNI that enforces.
+intro: |
+  Kubernetes networking is flat and open by default: any Pod can reach any
+  other Pod on any port. A NetworkPolicy changes that for the Pods it
+  **selects**: as soon as one policy selects a Pod for a direction, that
+  direction becomes deny-by-default and only traffic matching some policy's
+  rules is allowed. Policies are additive; there is no deny rule and no
+  ordering.
+
+  The API server only stores the object. Enforcement is the CNI plugin's
+  job: it watches NetworkPolicies, Pods and Namespaces and programs the data
+  plane (iptables, eBPF, OVS). A CNI without policy support (Flannel, or
+  kindnet before kind v0.24 added kube-network-policies) ignores them
+  entirely, so a policy is accepted and does nothing. This lab runs
+  **Calico**, which enforces them; `netpol-blocks-frontend` is the scenario
+  where you debug one that enforces too much.
+
+  You will write the policy for the `api` Deployment: who may call it and
+  what it may call. The semantics of a `from`/`to` list are the one thing to
+  get exactly right: a selector inside the same list item is an AND, two
+  items are an OR.
+prerequisites: [service-basics]
+crd: false
+docs_url: https://kubernetes.io/docs/concepts/services-networking/network-policies/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the API group that owns NetworkPolicy."
+    why: |
+      NetworkPolicy was introduced in `extensions/v1beta1` and moved to
+      `networking.k8s.io/v1` in 1.7; the old path was removed in 1.16. The
+      group only holds the *interface*: the built-in controller-manager has
+      no NetworkPolicy controller at all. If `kubectl get netpol` works but
+      traffic still flows, it is because the installed CNI does not
+      implement this API.
+    hint: "Same group as Ingress; the stable version."
+    expect: { type: equals, value: networking.k8s.io/v1 }
+    reveal: "apiVersion: networking.k8s.io/v1"
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `NetworkPolicy` is namespaced and only ever selects Pods in its own
+      namespace. There is no built-in cluster-wide policy; Calico and Cilium
+      provide their own CRDs (`GlobalNetworkPolicy`, `CiliumClusterwideNetworkPolicy`)
+      for that. Keep the two mental models apart: the Kubernetes object is
+      portable, the CNI CRDs are not.
+    hint: "CamelCase, two words, alias netpol."
+    expect: { type: equals, value: NetworkPolicy }
+    reveal: "kind: NetworkPolicy"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the policy after the Pods it protects."
+    why: |
+      Because policies are additive and unordered, the name is the only
+      place to encode intent. Convention: `<target>-<purpose>` (`api-allow-web`,
+      `default-deny-all`). When several policies select the same Pod, the
+      union of their rules applies, and `kubectl describe netpol` on each is
+      the only way to reconstruct the effective ruleset.
+    hint: "Lowercase DNS label; say what it protects, since several policies can stack on one Pod."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: api
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Put the policy in the namespace of the Pods it selects."
+    why: |
+      `spec.podSelector` is evaluated only in this namespace. A policy in
+      `lab-build` can allow traffic *from* other namespaces (via
+      `namespaceSelector`) but can only ever restrict Pods of `lab-build`.
+      To protect Pods in two namespaces you need two policies.
+    hint: "Where the api Pods run."
+    expect: { type: regex, value: "^lab-[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+  - path: spec.podSelector.matchLabels.app
+    title: "Target Pods"
+    prompt: "Select the api Pods this policy applies to."
+    why: |
+      `podSelector` is a full label selector (`matchLabels` or
+      `matchExpressions`) naming the Pods whose traffic is now governed.
+      An **empty** selector (`podSelector: {}`) selects every Pod in the
+      namespace, which is how a default-deny policy is written. Omitting
+      the field entirely is accepted and means the same thing: the policy
+      then isolates every Pod in the namespace, which is the more dangerous
+      mistake. Selection is by Pod labels, not by Deployment or Service, so
+      the labels come from the Pod template.
+    hint: "spec.podSelector.matchLabels with the Pod template label of the api Deployment."
+    expect: { type: equals, value: api }
+    reveal: |
+      spec:
+        podSelector:
+          matchLabels:
+            app: api
+    gotchas:
+      - "`podSelector: {}` plus `policyTypes: [Ingress, Egress]` and no rules is the namespace default-deny; start every namespace with it."
+  - path: spec.policyTypes
+    title: "Policy types"
+    prompt: "Govern both directions."
+    why: |
+      `policyTypes` decides which directions become deny-by-default for the
+      selected Pods. If omitted it is inferred: `Ingress` always, `Egress`
+      only if an `egress` section exists. That inference is a trap: a policy
+      with `policyTypes: [Ingress, Egress]` and no `egress` rules blocks all
+      outbound traffic, while the same policy without `policyTypes` leaves
+      egress open. Write it explicitly, always.
+    hint: "A list of strings; two values exist."
+    expect: { type: list, value: { min_items: 2 } }
+    reveal: |
+      policyTypes:
+        - Ingress
+        - Egress
+    gotchas:
+      - "Listing Egress here without any egress rule is a full outbound deny, including DNS."
+  - path: spec.ingress
+    title: "Ingress rules"
+    prompt: "Open the ingress list with one rule carrying from and ports."
+    why: |
+      Each `ingress` item is one rule: traffic is allowed if it matches
+      *any* rule. Inside a rule, `from` lists peers and `ports` lists ports,
+      and the rule matches when the source matches any `from` entry **and**
+      the destination port matches any `ports` entry. An empty `from` means
+      any source; an empty `ports` means any port; an item with neither
+      (`- {}`) allows everything.
+    hint: "A list of maps; this one needs both a from list and a ports list."
+    expect: { type: list, value: { min_items: 1, item_keys: [from, ports] } }
+    reveal: |
+      ingress:
+        - from:
+            - podSelector:
+                matchLabels:
+                  app: web
+          ports:
+            - protocol: TCP
+              port: 8080
+  - path: spec.ingress[0].from[0].podSelector.matchLabels.app
+    title: "Peer 1: the frontend (same namespace)"
+    prompt: "Allow Pods labelled app: web."
+    why: |
+      A `podSelector` alone in a `from` item matches Pods in the policy's
+      own namespace only. It is evaluated against the source Pod's labels at
+      the moment a connection is opened; relabel a Pod and new connections
+      are refused while established ones may survive through conntrack,
+      depending on the CNI. The Service in
+      front of `web` is irrelevant: policies see Pod IPs, never ClusterIPs.
+    hint: "A from item with a podSelector; the label of the web Pod template."
+    expect: { type: equals, value: web }
+    reveal: |
+      - podSelector:
+          matchLabels:
+            app: web
+  - path: spec.ingress[0].from[1].namespaceSelector.matchLabels
+    title: "Peer 2: a namespace, as a new list item (OR)"
+    prompt: "Add a second from item selecting the lab-monitoring namespace."
+    why: |
+      A second list item is an **OR** with the first: web Pods *or* this
+      peer. `namespaceSelector` matches Namespace objects by their labels,
+      not by name; since 1.21 every Namespace carries the immutable label
+      `kubernetes.io/metadata.name: <name>` precisely so that policies can
+      target a namespace by name. On its own, a `namespaceSelector` admits
+      *every* Pod in the matched namespaces.
+    hint: "A new - item in from. Namespaces are matched by label; one label exists on every namespace."
+    expect: { type: exists }
+    reveal: |
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: lab-monitoring
+    gotchas:
+      - "`namespaceSelector: {}` matches all namespaces. Combined with nothing else, it opens the port to the whole cluster."
+  - path: spec.ingress[0].from[1].podSelector.matchLabels.app
+    title: "Narrow peer 2 with a podSelector in the same item (AND)"
+    prompt: "Inside the same from item, require app: prometheus."
+    why: |
+      Putting `podSelector` in the **same** list item as `namespaceSelector`
+      makes them an **AND**: Pods labelled `app: prometheus` *in* namespaces
+      labelled `lab-monitoring`. Indent it as a sibling key, not as a new `-`
+      item; one dash of difference turns "Prometheus in monitoring" into
+      "anything in monitoring, or any Pod called prometheus in this
+      namespace". That single indentation is the most common NetworkPolicy
+      bug in review.
+    hint: "Same list item as the namespaceSelector: a sibling key, no new dash."
+    expect: { type: equals, value: prometheus }
+    reveal: |
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: lab-monitoring
+        podSelector:
+          matchLabels:
+            app: prometheus
+    gotchas:
+      - "A new `- podSelector` item would also match Pods in lab-build, because a lone podSelector means the policy's own namespace."
+  - path: spec.ingress[0].ports
+    title: "Ingress ports"
+    prompt: "Restrict the rule to the api container port."
+    why: |
+      `ports` applies to the whole rule: all peers above may reach only
+      these ports. `port` is the **Pod** port (container port or its name),
+      never the Service port, because the policy is enforced on the Pod's
+      interface after kube-proxy has already translated the ClusterIP. Named
+      ports resolve per Pod; `endPort` lets you express a range. Omit
+      `ports` and every port is open to those peers.
+    hint: "A list of protocol/port maps. Think container port, not Service port."
+    expect: { type: list, value: { min_items: 1, item_keys: [protocol, port] } }
+    reveal: |
+      ports:
+        - protocol: TCP
+          port: 8080
+    gotchas:
+      - "Writing the Service port (80) when the container listens on 8080 blocks everything, since the CNI sees the DNAT'ed destination."
+  - path: spec.egress
+    title: "Egress rules"
+    prompt: "Open the egress list with a DNS rule."
+    why: |
+      Because `policyTypes` includes Egress, the api Pods now have no
+      outbound access at all. The first thing to give back is DNS; without
+      it every call fails with `could not resolve host` and looks like an
+      application bug. Egress rules have the same structure as ingress with
+      `to` in place of `from`, and the same AND/OR rules.
+    hint: "A list of maps, each with to and ports. DNS first, or nothing else will resolve."
+    expect: { type: list, value: { min_items: 1, item_keys: [to, ports] } }
+    reveal: |
+      egress:
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: kube-system
+              podSelector:
+                matchLabels:
+                  k8s-app: kube-dns
+          ports:
+            - protocol: UDP
+              port: 53
+            - protocol: TCP
+              port: 53
+  - path: spec.egress[0].to[0].namespaceSelector.matchLabels
+    title: "DNS peer: CoreDNS in kube-system"
+    prompt: "Target the kube-system namespace, narrowed to the CoreDNS Pods."
+    why: |
+      CoreDNS runs in `kube-system` with the label `k8s-app: kube-dns`
+      (the label predates CoreDNS and was kept). The namespaceSelector and
+      the podSelector sit in the same item, so the rule is "CoreDNS Pods in
+      kube-system", not "anything in kube-system". The Pod talks to the
+      `kube-dns` ClusterIP, but the policy is evaluated after DNAT, against
+      the CoreDNS Pod IPs, which is why selecting Pods works here.
+    hint: "Same AND pattern as before: namespace by its metadata.name label, Pods by k8s-app."
+    expect: { type: exists }
+    reveal: |
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+    gotchas:
+      - "Clusters using NodeLocal DNSCache answer from a link-local IP on the node; the DNS egress rule then needs an ipBlock, not a podSelector."
+  - path: spec.egress[0].ports
+    title: "DNS ports: UDP and TCP"
+    prompt: "Allow port 53 on both protocols."
+    why: |
+      DNS uses UDP, and falls back to TCP for responses over 512 bytes or
+      when the resolver is asked for truncated answers; large SRV or AAAA
+      sets in clusters with many endpoints hit that path. Allowing only UDP
+      produces intermittent `i/o timeout` resolution errors that are
+      maddening to reproduce. Two list entries, same port, different
+      protocol.
+    hint: "Two entries for the same port; the default protocol is not enough."
+    expect: { type: list, value: { min_items: 2, item_keys: [protocol, port] } }
+    reveal: |
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+  - path: spec.egress[1].to[0].podSelector.matchLabels.app
+    title: "Second egress rule: Redis"
+    prompt: "Allow the api Pods to reach the redis Pods on 6379."
+    why: |
+      A second `egress` item is a separate rule, ORed with the DNS rule. The
+      api needs its cache; nothing else, so no rule for the internet, no
+      rule for the metadata service, no rule for other namespaces. This is
+      the point of egress policy: a compromised api Pod cannot exfiltrate
+      or scan. Remember the policy only restricts `api`; Redis needs its
+      own ingress policy if you want the symmetric guarantee.
+    hint: "A new - item under egress with its own to and ports; the redis Pod label."
+    expect: { type: equals, value: redis }
+    reveal: |
+      - to:
+          - podSelector:
+              matchLabels:
+                app: redis
+        ports:
+          - protocol: TCP
+            port: 6379
+final_manifest: |
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: api
+    namespace: lab-build
+  spec:
+    podSelector:
+      matchLabels:
+        app: api
+    policyTypes:
+      - Ingress
+      - Egress
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                app: web
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: lab-monitoring
+            podSelector:
+              matchLabels:
+                app: prometheus
+        ports:
+          - protocol: TCP
+            port: 8080
+    egress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                k8s-app: kube-dns
+        ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
+      - to:
+          - podSelector:
+              matchLabels:
+                app: redis
+        ports:
+          - protocol: TCP
+            port: 6379
+apply:
+  mode: dry-run
+  requires_addons: []
+quiz:
+  - q: "In a from list, namespaceSelector and podSelector are written as two separate - items. What is allowed?"
+    options:
+      - "Only Pods matching both selectors"
+      - "Any Pod in the matched namespaces, OR Pods matching the podSelector in the policy's own namespace"
+      - "Nothing: the API server rejects ambiguous peers"
+      - "Only Pods matching the podSelector, in any namespace"
+    answer: 1
+    explain: "Separate items are ORed. A lone podSelector is scoped to the policy's namespace; a lone namespaceSelector admits whole namespaces."
+  - q: "A policy sets policyTypes: [Ingress, Egress] with ingress rules but no egress section. Effect on the selected Pods?"
+    options:
+      - "Egress is unrestricted because no egress rules exist"
+      - "All egress is denied, including DNS"
+      - "The policy is rejected"
+      - "Only DNS egress is allowed by default"
+    answer: 1
+    explain: "Listing a direction in policyTypes makes it deny-by-default; with no rules, nothing is allowed back."
+  - q: "You apply this policy on a cluster running Flannel and traffic from an unrelated Pod still reaches api. Why?"
+    options:
+      - "The podSelector is wrong"
+      - "NetworkPolicy needs a restart of kube-proxy"
+      - "The CNI does not implement NetworkPolicy; the object is stored but nothing enforces it"
+      - "The policy only applies to new Pods"
+    answer: 2
+    explain: "Enforcement is the CNI's job. Flannel ignores policies; Calico, Cilium, Antrea and others enforce them, and kindnet gained enforcement in kind v0.24 via kube-network-policies."

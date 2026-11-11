@@ -1,0 +1,179 @@
+id: flux-helmrepository
+title: "Flux HelmRepository: declare a chart source"
+kind: HelmRepository
+apiVersion: source.toolkit.fluxcd.io/v1
+realm: manifests
+track: flux
+difficulty: beginner
+estimated_minutes: 10
+summary: >
+  Build the HelmRepository for the podinfo chart and learn the difference
+  between an HTTPS repository whose index.yaml source-controller must
+  download and an OCI registry that needs no index at all.
+intro: |
+  A classic Helm repository is a static web site: an `index.yaml` listing
+  every chart version plus the `.tgz` files it points to. A
+  `HelmRepository` object tells `source-controller` to fetch that index on
+  an interval and store it as an artifact (revision = digest of the
+  index). When a `HelmRelease` asks for `podinfo` version `6.x`,
+  helm-controller creates a `HelmChart` object, source-controller resolves
+  the range against the **index artifact**, downloads the matching `.tgz`
+  and publishes *that* as a second artifact for helm-controller.
+
+  OCI registries (`oci://ghcr.io/...`) have no index: each chart version
+  is a tag. A `HelmRepository` of `type: oci` is therefore a static pointer
+  with credentials, nothing is fetched until a HelmChart needs a version.
+  The final manifest here is the HTTPS flavour; one step shows what
+  changes for OCI.
+prerequisites: []
+crd: true
+docs_url: https://fluxcd.io/flux/components/source/helmrepositories/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare which API this object speaks."
+    why: |
+      Chart repositories are sources, so they belong to
+      `source.toolkit.fluxcd.io`, not to the helm-controller group. `v1`
+      became the stable version in Flux 2.3 together with `HelmChart`; the
+      promotion also made `interval` optional for OCI repositories because
+      they have nothing to poll.
+    hint: "Same group as GitRepository; stable version v1."
+    expect: { type: equals, value: source.toolkit.fluxcd.io/v1 }
+    reveal: "apiVersion: source.toolkit.fluxcd.io/v1"
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `HelmRepository` is one of two ways to feed charts to helm-controller.
+      The other is a `GitRepository` or `OCIRepository` pointing at a chart
+      directory or artifact. Use HelmRepository for charts you consume from
+      upstream publishers; use Git for charts you author alongside your
+      app.
+    hint: "CamelCase, singular."
+    expect: { type: equals, value: HelmRepository }
+    reveal: "kind: HelmRepository"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the repository after the publisher or project."
+    why: |
+      HelmReleases reference it with `chart.spec.sourceRef.name`, and the
+      HelmChart objects source-controller generates are named
+      `<release-namespace>-<release-name>`, so the repository name only
+      appears in `flux get sources helm`. Name it after the project
+      (`podinfo`, `bitnami`, `jetstack`) rather than after a single chart.
+    hint: "Lowercase DNS label."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: podinfo
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place the repository in the Flux namespace."
+    why: |
+      Chart sources are shared infrastructure: one HelmRepository can serve
+      HelmReleases in many namespaces through `sourceRef.namespace`.
+      Credentials in `spec.secretRef` must sit in the same namespace as
+      this object, so centralising in `flux-system` means one registry
+      Secret for the whole cluster.
+    hint: "The namespace Flux was installed in."
+    expect: { type: equals, value: flux-system }
+    reveal: "  namespace: flux-system"
+  - path: spec.interval
+    title: "Interval"
+    prompt: "Set how often the index is re-downloaded."
+    why: |
+      For `type: default` the interval drives `GET <url>/index.yaml`. The
+      artifact only changes when the index digest changes, so a long
+      interval is fine: a new chart version becomes visible to Flux at most
+      one interval after publication. Large indexes (some public repos
+      ship tens of megabytes) are parsed in memory on every fetch, which is
+      a real reason to prefer `1h` over `1m` and to prefer OCI where
+      available.
+    hint: "Go duration; charts are published rarely, think minutes to hours."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: |
+      spec:
+        interval: 1h
+    gotchas:
+      - "The HelmRelease's chart.spec.interval controls how often a version range is re-resolved; this interval only refreshes the index."
+  - path: spec.url
+    title: "Repository URL"
+    prompt: "Point at the podinfo chart repository."
+    why: |
+      For HTTPS repositories the URL is the directory that contains
+      `index.yaml`; source-controller appends the file name itself. The
+      scheme also selects `type`: an `oci://` URL requires `type: oci`
+      and the host is then a registry, not a web server. Private
+      repositories add `secretRef` (basic auth) or `certSecretRef` (custom
+      CA / client cert) in this namespace.
+    hint: "HTTPS URL of the chart repo; no index.yaml at the end."
+    expect: { type: regex, value: "^(https?|oci)://.+" }
+    reveal: "  url: https://stefanprodan.github.io/podinfo"
+    gotchas:
+      - "Pasting the index.yaml URL itself produces a 404 for <url>/index.yaml/index.yaml."
+  - path: spec.type
+    title: "Repository type"
+    prompt: "State the repository type explicitly: default for index-based repos, oci for registries."
+    why: |
+      `type` is the switch between two mechanisms. `default` means an
+      index-based repository that is polled and produces an artifact.
+      `oci` means a registry (`oci://ghcr.io/stefanprodan/charts`): no
+      index, no artifact, no polling. Versions are resolved per chart by
+      listing tags, and auth can come from `secretRef` (a dockerconfigjson
+      Secret) or from `provider: aws|azure|gcp` for workload identity. This
+      repository is index-based, so keep `default`; the field is optional
+      but writing it documents the choice.
+    hint: "Two values exist; the HTTPS podinfo repo is the index-based kind."
+    expect: { type: oneOf, value: [default, oci] }
+    reveal: "  type: default"
+    gotchas:
+      - "An oci:// URL with type default fails with 'invalid Helm repository URL'; type oci with an https URL fails the same way."
+      - "For type oci, interval is ignored and status.artifact is never populated: 'flux get sources helm' shows no revision, and that is normal."
+  - path: spec.timeout
+    title: "Timeout"
+    prompt: "Bound how long an index download may take."
+    why: |
+      `timeout` caps a single index fetch (default `60s`). It matters for
+      slow mirrors and large indexes: when exceeded the condition is
+      `FetchFailed` and the previous artifact stays in place, so existing
+      HelmReleases keep working but new versions are not discovered until a
+      fetch succeeds. Keep it shorter than `interval`.
+    hint: "A Go duration; the index of a big repo can be tens of megabytes."
+    expect: { type: regex, value: "^([0-9]+(h|m|s))+$" }
+    reveal: "  timeout: 60s"
+final_manifest: |
+  apiVersion: source.toolkit.fluxcd.io/v1
+  kind: HelmRepository
+  metadata:
+    name: podinfo
+    namespace: flux-system
+  spec:
+    interval: 1h
+    timeout: 60s
+    type: default
+    url: https://stefanprodan.github.io/podinfo
+apply:
+  mode: dry-run
+  requires_addons: [flux]
+quiz:
+  - q: "A HelmRelease asks for chart podinfo version 6.x. Which object resolves the range to an exact version?"
+    options:
+      - "helm-controller, by running helm search"
+      - "source-controller, through the HelmChart it builds against the repository artifact"
+      - "The HelmRepository itself in its status"
+      - "kustomize-controller"
+    answer: 1
+    explain: "helm-controller only creates a HelmChart; source-controller resolves and downloads the chart."
+  - q: "What does source-controller store as the artifact of a type: default HelmRepository?"
+    options: ["Every chart tarball", "The index.yaml", "Nothing; it only validates the URL", "The latest chart only"]
+    answer: 1
+    explain: "The index is the artifact; individual charts are fetched on demand by HelmChart objects."
+  - q: "Which statement about type: oci is true?"
+    options:
+      - "It needs a shorter interval because tags change often"
+      - "It polls index.yaml over HTTPS"
+      - "It is a static pointer: nothing is fetched until a HelmChart needs a version"
+      - "It cannot use credentials"
+    answer: 2
+    explain: "OCI repositories have no index; versions are resolved per chart by listing registry tags."

@@ -1,0 +1,359 @@
+id: hpa-autoscaling
+title: "HorizontalPodAutoscaler: scale on measured CPU, not on hope"
+kind: HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+realm: manifests
+track: core
+difficulty: intermediate
+estimated_minutes: 20
+summary: >
+  Build an autoscaling/v2 HPA for the web Deployment: the scale target, the
+  replica bounds, a CPU utilization metric, then the behavior block that stops
+  it from flapping. Learn what metrics-server provides, what the controller
+  computes, and why spec.replicas must leave your Git repository.
+intro: |
+  The HPA is a control loop inside kube-controller-manager. Every 15 seconds
+  (`--horizontal-pod-autoscaler-sync-period`) it reads a metric for the Pods
+  of a target, computes
+
+  `desiredReplicas = ceil(currentReplicas * currentMetric / targetMetric)`
+
+  and writes the result to the target's **scale subresource**
+  (`/apis/apps/v1/namespaces/<ns>/deployments/<name>/scale`). It never touches
+  Pods and it never reads `spec.replicas` from your YAML; it reads the live
+  object.
+
+  Resource metrics come from the `metrics.k8s.io` API, which is served by
+  **metrics-server**, an aggregated API server that scrapes every kubelet's
+  `/metrics/resource` endpoint. No metrics-server, no `kubectl top`, no HPA:
+  the controller logs `FailedGetResourceMetric` and leaves the replica count
+  alone. This lab's `metrics-server` addon installs it for you.
+
+  One rule follows from the loop above: if an HPA owns a Deployment,
+  **remove `spec.replicas` from the manifest in Git**. Otherwise every
+  `kubectl apply` or Flux reconciliation resets the count to the file value and
+  the HPA scales it back, forever.
+prerequisites: [deployment-basics]
+crd: false
+docs_url: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+steps:
+  - path: apiVersion
+    title: "API group and version"
+    prompt: "Declare the autoscaling API version."
+    why: |
+      `autoscaling/v1` only supports a single CPU percentage and has no
+      `behavior` block. `autoscaling/v2` (GA in 1.23) adds memory, custom and
+      external metrics, multiple metrics and scaling policies. The beta
+      versions were removed (`v2beta1` in 1.25, `v2beta2` in 1.26) and still
+      appear in old blog posts; the API server rejects them.
+    hint: "Group autoscaling, the stable version that supports behavior and multiple metrics."
+    expect: { type: equals, value: autoscaling/v2 }
+    reveal: "apiVersion: autoscaling/v2"
+    gotchas:
+      - "kubectl get hpa still prints TARGETS in the v1 shape; that does not mean the object is v1."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      Long name, short alias: `kubectl get hpa`. One HPA per target; two HPAs
+      pointing at the same Deployment fight each other and the API does not
+      prevent it. The HPA is namespaced and must live in the namespace of its
+      target, because `scaleTargetRef` has no namespace field.
+    hint: "CamelCase, three words."
+    expect: { type: equals, value: HorizontalPodAutoscaler }
+    reveal: "kind: HorizontalPodAutoscaler"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the HPA."
+    why: |
+      Convention is to name the HPA after its target so that
+      `kubectl describe hpa web` is the first command in an incident. The
+      `describe` output is where the controller writes its reasoning:
+      `AbleToScale`, `ScalingActive`, `ScalingLimited` conditions and the last
+      computed metric values.
+    hint: "Lowercase DNS label; naming it after the target saves you a lookup at 3 a.m."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: web
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Put the HPA where its Deployment lives."
+    why: |
+      `scaleTargetRef` only carries apiVersion, kind and name; the namespace is
+      implicitly the HPA's own. An HPA created in the wrong namespace reports
+      `AbleToScale: False` with reason `FailedGetScale` and the message
+      `deployments/scale.apps "web" not found`, which looks like an RBAC
+      problem until you read the namespace column.
+    hint: "Same namespace as the Deployment; the target reference cannot cross namespaces."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+  - path: spec.scaleTargetRef.apiVersion
+    title: "Target API version"
+    prompt: "State the API version of the object to scale."
+    why: |
+      The controller resolves the target through the discovery API to find
+      its `scale` subresource. The apiVersion must be the one the target is
+      served under (`apps/v1` for Deployments), not the HPA's own. Any kind
+      that exposes `/scale` works, including CustomResources whose CRD
+      declares `subresources.scale`, which is how operators make their
+      objects autoscalable.
+    hint: "The group/version of a Deployment, not of the HPA."
+    expect: { type: equals, value: apps/v1 }
+    reveal: |
+      spec:
+        scaleTargetRef:
+          apiVersion: apps/v1
+  - path: spec.scaleTargetRef.kind
+    title: "Target kind"
+    prompt: "State the kind of the object to scale."
+    why: |
+      Deployment or StatefulSet in practice. Never target the ReplicaSet of a
+      Deployment: the next rollout creates a new ReplicaSet and the HPA keeps
+      scaling the old, empty one while the Deployment controller resets it.
+      Targeting the Deployment lets the Deployment propagate the count to
+      whichever ReplicaSet is current.
+    hint: "The owner of the Pods, not the intermediate object a rollout replaces."
+    expect: { type: oneOf, value: [Deployment, StatefulSet] }
+    reveal: "kind: Deployment"
+    gotchas:
+      - "ReplicaSet is a legal target and a classic mistake: it scales a ReplicaSet the next rollout will abandon."
+  - path: spec.scaleTargetRef.name
+    title: "Target name"
+    prompt: "Name the Deployment to scale."
+    why: |
+      Exact match on `metadata.name`, no selector. A typo is not rejected at
+      apply time because the target may be created later; the HPA simply
+      sits in `AbleToScale: False` with `FailedGetScale`. Check
+      `kubectl get hpa` for `<unknown>` in the TARGETS column, which means the
+      controller could not reach either the target or the metric.
+    hint: "The Deployment name from deployment-basics, character for character."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "name: web"
+  - path: spec.minReplicas
+    title: "Minimum replicas"
+    prompt: "Set the floor the autoscaler can never go below."
+    why: |
+      The floor is a capacity and availability decision, not a cost one: it
+      is what absorbs the first seconds of a burst while new Pods start, and
+      it is what your PodDisruptionBudget math assumes during a node drain.
+      Defaults to 1; a value of 0 is allowed since the `HPAScaleToZero` gate
+      went beta (on by default) in 1.37, but it still needs an object or
+      external metric, since a Pod with zero replicas has no CPU to measure.
+    hint: "An integer, at least 1. Think of it as the burst buffer, not the idle cost."
+    expect: { type: integer }
+    reveal: "minReplicas: 2"
+  - path: spec.maxReplicas
+    title: "Maximum replicas"
+    prompt: "Cap the number of Pods."
+    why: |
+      `maxReplicas` is required and must be at least `minReplicas`. It is the
+      guard against a metric bug: a retry storm or a mis-scaled custom metric
+      can push the recommendation to hundreds of Pods, and this field is what
+      stops it from eating the cluster. Size it from node capacity and
+      ResourceQuota, not from optimism. When the HPA hits it, the condition
+      `ScalingLimited: True` appears in describe.
+    hint: "An integer not lower than minReplicas. What can the namespace quota actually host?"
+    expect: { type: integer }
+    reveal: "maxReplicas: 10"
+  - path: spec.metrics
+    title: "Metrics list"
+    prompt: "Open the metrics list with one Resource metric."
+    why: |
+      `metrics` is a list because an HPA can watch several signals at once.
+      The controller computes a desired replica count for *each* metric and
+      applies the **highest**. A metric it cannot read is skipped for
+      scale-down decisions and treated as a reason to hold, which is why a
+      broken custom metrics adapter can freeze an HPA.
+    hint: "A list of maps; each entry starts with type."
+    expect: { type: list, value: { min_items: 1, item_keys: [type] } }
+    reveal: |
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+  - path: spec.metrics[0].type
+    title: "Metric type"
+    prompt: "Use a Resource metric."
+    why: |
+      Five types exist. `Resource` (cpu, memory from metrics-server) and
+      `ContainerResource` (the same, for one named container of the Pod)
+      come from `metrics.k8s.io`. `Pods` and `Object` come from
+      `custom.metrics.k8s.io` and `External` from `external.metrics.k8s.io`,
+      which only exist if you install an adapter such as prometheus-adapter
+      or KEDA. The type decides which sibling block the controller reads.
+    hint: "The type served by metrics-server, no adapter required."
+    expect: { type: equals, value: Resource }
+    reveal: "- type: Resource"
+  - path: spec.metrics[0].resource.name
+    title: "Resource name"
+    prompt: "Scale on CPU."
+    why: |
+      CPU is proportional to load for most request-driven services and drops
+      when load is spread across more Pods, which is what makes the control
+      loop converge. Memory usually does not: garbage-collected runtimes keep
+      their heap, caches fill up, and adding Pods does not reduce per-Pod
+      memory, so a memory HPA tends to scale up and never back down.
+    hint: "The resource whose usage falls when you add replicas."
+    expect: { type: equals, value: cpu }
+    reveal: "name: cpu"
+    gotchas:
+      - "Memory-based HPAs rarely scale down; use them only for workloads whose memory really is per-request."
+  - path: spec.metrics[0].resource.target.type
+    title: "Target type"
+    prompt: "Express the target as a utilization percentage."
+    why: |
+      `Utilization` is the average across Pods of `usage / requests`, as a
+      percentage. `AverageValue` is an absolute quantity per Pod (`200m`).
+      `Value` is only valid for Object metrics. Utilization therefore requires
+      a CPU **request** on every container of the Pod; a Pod with a container
+      missing it is dropped from the calculation and the HPA reports
+      `missing request for cpu` in `FailedGetResourceMetric`.
+    hint: "Percentage of requests, which is why the Deployment needed resources.requests.cpu."
+    expect: { type: equals, value: Utilization }
+    reveal: "type: Utilization"
+    gotchas:
+      - "Utilization is relative to requests, not limits. A Pod requesting 100m and using 150m is at 150%."
+  - path: spec.metrics[0].resource.target.averageUtilization
+    title: "Target utilization"
+    prompt: "Pick the CPU percentage the autoscaler should aim for."
+    why: |
+      The controller scales when `current / target` leaves a tolerance band
+      of 10 percent around 1.0 (`--horizontal-pod-autoscaler-tolerance`).
+      Pods not yet Ready are excluded, and during the CPU initialization
+      period (default 5 minutes) an unready Pod's CPU is ignored, so a
+      startup spike does not trigger a scale-up. A target of 70 leaves headroom for the time it takes new
+      Pods to become Ready; 90 means you are already saturated when the
+      decision is made.
+    hint: "An integer percentage. Leave headroom for Pod startup time."
+    expect: { type: integer }
+    reveal: "averageUtilization: 70"
+  - path: spec.behavior.scaleDown.stabilizationWindowSeconds
+    title: "Scale-down stabilization"
+    prompt: "Make scale-down wait before trusting a low reading."
+    why: |
+      The controller keeps every recommendation computed during the window
+      and, for scale-down, applies the **highest** of them. That is what
+      prevents flapping when traffic oscillates: capacity is only removed if
+      no recommendation in the last N seconds wanted it. The default is 300
+      seconds for scale-down and 0 for scale-up, so a burst is answered
+      immediately and the cool-down is slow.
+    hint: "An integer in seconds under spec.behavior.scaleDown. The default is already 300."
+    expect: { type: integer }
+    reveal: |
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 10
+              periodSeconds: 60
+  - path: spec.behavior.scaleDown.policies
+    title: "Scale-down rate limit"
+    prompt: "Limit how fast capacity can be removed."
+    why: |
+      A policy is `type` (Percent or Pods), `value` and `periodSeconds`
+      (up to 1800). Without one, the default scale-down policy is 100 percent
+      per 15 seconds: once the stabilization window passes, the HPA can halve
+      the fleet in a single step. `Percent 10 / 60` removes at most a tenth
+      of the Pods per minute. With several policies, `selectPolicy` chooses
+      the most permissive (`Max`, the default), the least (`Min`) or turns
+      the direction off (`Disabled`).
+    hint: "A list of maps with type, value, periodSeconds. Percent or Pods."
+    expect: { type: list, value: { min_items: 1, item_keys: [type, value, periodSeconds] } }
+    reveal: |
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    gotchas:
+      - "selectPolicy: Disabled on scaleDown is how you build a one-way autoscaler for a workload that must never shrink automatically."
+  - path: spec.behavior.scaleUp.policies
+    title: "Scale-up policy"
+    prompt: "Make the scale-up rule explicit."
+    why: |
+      The default scale-up is already aggressive: the larger of 4 Pods or
+      100 percent every 15 seconds, no stabilization. Writing it down keeps
+      the two directions reviewable side by side and lets you cap a runaway
+      metric (for example `Pods 4 / 60`) while still doubling small fleets
+      quickly. Periods under 60 seconds rarely help: new Pods are excluded
+      from the metric until Ready anyway.
+    hint: "Same shape as scaleDown.policies, under spec.behavior.scaleUp."
+    expect: { type: list, value: { min_items: 1, item_keys: [type, value, periodSeconds] } }
+    reveal: |
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+          - type: Pods
+            value: 4
+            periodSeconds: 60
+final_manifest: |
+  apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: web
+    namespace: lab-build
+    labels:
+      app: web
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: web
+    minReplicas: 2
+    maxReplicas: 10
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 70
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+          - type: Pods
+            value: 4
+            periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 10
+            periodSeconds: 60
+apply:
+  mode: dry-run
+  requires_addons: [metrics-server]
+quiz:
+  - q: "The Deployment's container has no resources.requests.cpu. What does the HPA do?"
+    options:
+      - "Falls back to limits"
+      - "Assumes 1 CPU per Pod"
+      - "Reports FailedGetResourceMetric (missing request for cpu) and does not scale"
+      - "Scales on absolute millicores instead"
+    answer: 2
+    explain: "Utilization is usage divided by requests. Without a request there is no denominator and the Pod is excluded."
+  - q: "Git still contains spec.replicas: 3 for the Deployment. The HPA has scaled it to 6. Flux reconciles every 10 minutes. What happens?"
+    options:
+      - "Nothing: Flux ignores replicas when an HPA exists"
+      - "Flux resets replicas to 3 at every sync and the HPA scales back up: a 10-minute flap that drops capacity each time"
+      - "The HPA is deleted by Flux"
+      - "Flux updates the file in Git to 6"
+    answer: 1
+    explain: "The HPA writes to the live object; GitOps rewrites it from the file. Remove spec.replicas from the manifest."
+  - q: "Two metrics: CPU recommends 4 replicas, a custom requests-per-second metric recommends 7. Result?"
+    options: ["4", "7", "The average, 6", "The HPA refuses conflicting metrics"]
+    answer: 1
+    explain: "The controller computes a desired count per metric and applies the highest."

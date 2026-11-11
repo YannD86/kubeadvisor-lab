@@ -1,0 +1,273 @@
+id: service-basics
+title: "Service: a stable name and port in front of moving Pods"
+kind: Service
+apiVersion: v1
+realm: manifests
+track: core
+difficulty: beginner
+estimated_minutes: 15
+summary: >
+  Build a ClusterIP Service for the web Deployment and learn the two contracts
+  it carries: the label selector that fills EndpointSlices and the port mapping
+  that kube-proxy programs. Finish with sessionAffinity and what it really does.
+intro: |
+  Pods are ephemeral: every rollout, eviction or node failure hands them a new
+  IP. A Service is the stable front: one virtual IP (the ClusterIP), one DNS
+  name (`web.lab-build.svc.cluster.local`) and a port mapping.
+
+  Nothing in a Service knows about Deployments. The EndpointSlice controller
+  lists the Pods whose labels match `spec.selector`, keeps the ones that are
+  Ready, and writes their IPs and resolved ports into EndpointSlice objects.
+  kube-proxy watches those slices and programs iptables/IPVS rules so that a
+  packet sent to the ClusterIP is DNAT'ed to one Pod IP. The Service itself is
+  never on the data path.
+
+  So a Service is two contracts: labels (who) and ports (where). Break either
+  one and you get the classic "connection refused while every Pod is Running"
+  ticket that you will debug in the `svc-selector-mismatch` and
+  `svc-wrong-targetport` scenarios.
+prerequisites: [deployment-basics]
+crd: false
+docs_url: https://kubernetes.io/docs/concepts/services-networking/service/
+steps:
+  - path: apiVersion
+    title: "API version"
+    prompt: "Declare the API this object speaks."
+    why: |
+      Service belongs to the *core* (legacy) group, which has no name: the
+      version is just `v1` and the REST path is `/api/v1/...` instead of
+      `/apis/<group>/<version>/...`. Services predate API groups and were never
+      moved, which is why the objects invented later for the same problem space
+      (Ingress, NetworkPolicy, IngressClass) live in `networking.k8s.io`
+      instead. Writing `core/v1` or `networking.k8s.io/v1` here is rejected.
+    hint: "Core group, no prefix: the same version string as Pod and ConfigMap."
+    expect: { type: equals, value: v1 }
+    reveal: "apiVersion: v1"
+    gotchas:
+      - "`core/v1` is how some tools print the group internally; the API server does not accept it in a manifest."
+  - path: kind
+    title: "Kind"
+    prompt: "Name the resource type."
+    why: |
+      `kind: Service` plus `v1` routes the object to
+      `/api/v1/namespaces/<ns>/services`. The EndpointSlice objects you will
+      see later are *not* something you write: the controller derives them
+      from this object, names them after it and labels them with
+      `kubernetes.io/service-name`, which is how you find them.
+    hint: "CamelCase, singular."
+    expect: { type: equals, value: Service }
+    reveal: "kind: Service"
+  - path: metadata.name
+    title: "Name"
+    prompt: "Name the Service; this becomes a DNS hostname."
+    why: |
+      CoreDNS answers `<name>.<namespace>.svc.cluster.local` with the
+      ClusterIP, so the name must be a valid DNS *label* under RFC 1035: it
+      cannot start with a digit, unlike most other objects (RFC 1123). kubelet
+      also injects `WEB_SERVICE_HOST` and `WEB_SERVICE_PORT` env vars derived
+      from this name into every Pod created *after* the Service in the same
+      namespace, never into Pods that already existed.
+    hint: "Lowercase DNS label that will be a hostname; it cannot start with a digit."
+    expect: { type: regex, value: "^[a-z]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: |
+      metadata:
+        name: web
+    gotchas:
+      - "Docker-style env injection: a Service named `web` sets WEB_PORT=tcp://<clusterip>:80 in every later Pod of the namespace, overriding an image ENV of the same name."
+  - path: metadata.namespace
+    title: "Namespace"
+    prompt: "Place the Service in the namespace of the Pods it will select."
+    why: |
+      The selector never crosses namespaces: the EndpointSlice controller only
+      lists Pods in the Service's own namespace. DNS is scoped the same way,
+      `web` resolves only from Pods in `lab-build`; everybody else must write
+      `web.lab-build` or the FQDN. A Service in the wrong namespace is a
+      Service with zero endpoints and a perfectly green `kubectl get svc`.
+    hint: "Same namespace as the Deployment from deployment-basics."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+    reveal: "  namespace: lab-build"
+  - path: metadata.labels.app
+    title: "Labels on the Service"
+    prompt: "Label the Service itself with app: web."
+    why: |
+      These labels play no part in routing. They matter for tooling that
+      selects *Services* rather than Pods: `kubectl get svc -l app=web`, and
+      Prometheus Operator `ServiceMonitor` objects, which match Service labels
+      to decide what to scrape. A Service with no labels is invisible to a
+      ServiceMonitor even if its Pods expose metrics.
+    hint: "metadata.labels is a map; mirror the Pod labels so humans can follow the chain."
+    expect: { type: equals, value: web }
+    reveal: |
+      labels:
+        app: web
+  - path: spec.type
+    title: "Service type"
+    prompt: "Make this an internal, cluster-only Service."
+    why: |
+      `ClusterIP` is the default and the base of every other type: NodePort is
+      a ClusterIP plus a port opened on every node, LoadBalancer is a NodePort
+      plus a cloud load balancer pointing at it. `ExternalName` is just a DNS
+      CNAME with no proxying. Write ClusterIP explicitly so a reviewer sees the
+      intent and a copy-paste from a NodePort sample does not silently expose
+      an internal API on every node.
+    hint: "The default type, the one every other type is built on."
+    expect: { type: equals, value: ClusterIP }
+    reveal: |
+      spec:
+        type: ClusterIP
+    gotchas:
+      - "`type` is mutable but `spec.clusterIP` is not: switching ClusterIP to NodePort keeps the VIP; delete/recreate changes it."
+  - path: spec.selector.app
+    title: "Selector"
+    prompt: "Select the Pods by label: app: web."
+    why: |
+      This is the contract with the Pods. The EndpointSlice controller lists
+      Pods in this namespace carrying every key/value here and publishes the
+      Ready ones. It is a flat equality map, not `matchLabels` and not
+      `matchExpressions`, and it must match the *Pod template* labels of the
+      Deployment, not the Deployment's own labels. A Service with no selector
+      is legal: it gets no endpoints and you write them yourself, which is how
+      you point a Service at an external database.
+    hint: "A flat key/value map directly under selector. Copy the Pod template labels, not the Deployment's."
+    expect: { type: equals, value: web }
+    reveal: |
+      selector:
+        app: web
+    gotchas:
+      - "`selector.matchLabels` is rejected here: the Service selector is a plain map, unlike Deployment."
+      - "Running Pods plus an empty EndpointSlice means the selector matched nothing. Scenario: svc-selector-mismatch."
+  - path: spec.ports
+    title: "Ports list"
+    prompt: "Open the ports list with one named entry."
+    why: |
+      `ports` is a list because one Service can front several ports, typically
+      `http` and `metrics`. The API requires a `name` on each entry as soon as
+      there are two, but name it even with one: Ingress `backend.service.port.name`,
+      Prometheus `endpoints[].port` and service meshes all reference ports by
+      name, and adding a second port later would otherwise force a rename.
+    hint: "A YAML list of maps: name, port, targetPort for each entry."
+    expect: { type: list, value: { min_items: 1, item_keys: [name, port, targetPort] } }
+    reveal: |
+      ports:
+        - name: http
+          port: 80
+          targetPort: http
+  - path: spec.ports[0].name
+    title: "Port name"
+    prompt: "Name the port after its application protocol."
+    why: |
+      A port name is an IANA service name: at most 15 characters, lowercase
+      letters, digits and hyphens, at least one letter. The convention is to
+      name it after the protocol (`http`, `grpc`, `https`, `redis`) because
+      meshes like Istio and Linkerd read the name or its prefix
+      (`http-metrics`) to decide how to parse the traffic; a port called
+      `web` is treated as opaque TCP and loses L7 routing and metrics.
+    hint: "At most 15 chars, lowercase. The protocol, not the component."
+    expect: { type: regex, value: "^[a-z0-9]([-a-z0-9]{0,13}[a-z0-9])?$" }
+    reveal: "name: http"
+  - path: spec.ports[0].port
+    title: "Service port"
+    prompt: "Set the port clients dial on the ClusterIP."
+    why: |
+      `port` is the Service-side number: what a client dials on the ClusterIP
+      or the DNS name. It does not have to equal the container's port, and it
+      is the number that `kubectl get svc` and `WEB_SERVICE_PORT` show.
+      Choosing the protocol's well-known port lets clients write `http://web`
+      without `:8080`, which is what every URL in a ConfigMap will end up
+      doing.
+    hint: "An integer. The well-known port for the protocol lets clients omit it in URLs."
+    expect: { type: integer }
+    reveal: "port: 80"
+  - path: spec.ports[0].targetPort
+    title: "Target port, by name"
+    prompt: "Point targetPort at the container port by its name."
+    why: |
+      `targetPort` is the Pod-side port: a number, or a *name* resolved per
+      Pod against `containers[].ports[].name`. Using the name decouples the
+      two: you can move the container from 80 to 8080 by editing only the
+      Deployment, and the Service follows at the next rollout. When omitted,
+      `targetPort` defaults to `port`, which is exactly the failure in
+      `svc-wrong-targetport`. The EndpointSlice carries the resolved number,
+      so that is where you check what was really programmed.
+    hint: "Not a number: reference the containerPort name you declared in deployment-basics."
+    expect: { type: equals, value: http }
+    reveal: "targetPort: http"
+    gotchas:
+      - "Omitted targetPort silently equals port: a Service on 80 in front of a container on 8080 gives connection refused."
+      - "A named targetPort that no container declares yields a Pod with no endpoint, not a validation error."
+  - path: spec.ports[0].protocol
+    title: "Protocol"
+    prompt: "State the L4 protocol explicitly."
+    why: |
+      The default is TCP, and kube-proxy programs separate rules per protocol.
+      A DNS or syslog Service that forgets `protocol: UDP` silently drops
+      everything while looking healthy. Writing TCP here is cheap and makes
+      the intent reviewable; it also matters for conntrack, which treats UDP
+      flows differently and is behind the "DNS worked, then stopped after a
+      CoreDNS restart" class of incidents.
+    hint: "TCP, UDP or SCTP; the default is TCP."
+    expect: { type: oneOf, value: [TCP, UDP, SCTP] }
+    reveal: "protocol: TCP"
+  - path: spec.sessionAffinity
+    title: "Session affinity"
+    prompt: "Decide explicitly whether clients stick to one backend."
+    why: |
+      Service load balancing is per connection: random with iptables,
+      round-robin with IPVS. `ClientIP` makes kube-proxy pin a source IP to
+      one backend for `sessionAffinityConfig.clientIP.timeoutSeconds` (default
+      10800). It is the only L4 stickiness Kubernetes offers and it is almost
+      always wrong behind an Ingress controller or a cloud load balancer:
+      every request then arrives from the proxy's IP, so *all* traffic sticks
+      to a single Pod. Write `None` and do stickiness with cookies at L7.
+    hint: "None or ClientIP. ClientIP keys on the source address; ask yourself who the source really is."
+    expect: { type: oneOf, value: [None, ClientIP] }
+    reveal: "sessionAffinity: None"
+    gotchas:
+      - "Behind ingress-nginx without proxy protocol the client IP is the controller Pod: ClientIP affinity pins everything to one backend."
+      - "ClientIP affinity is tracked per node (iptables recent module): the same client entering through two NodePorts can be pinned to two different Pods."
+final_manifest: |
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: web
+    namespace: lab-build
+    labels:
+      app: web
+  spec:
+    type: ClusterIP
+    selector:
+      app: web
+    ports:
+      - name: http
+        port: 80
+        targetPort: http
+        protocol: TCP
+    sessionAffinity: None
+apply:
+  mode: create
+  requires_addons: []
+quiz:
+  - q: "Service web in lab-build selects app=web. The only app=web Pods run in namespace lab-api. What does kubectl get endpointslices show for web?"
+    options:
+      - "The lab-api Pod IPs, because labels are cluster-wide"
+      - "No endpoints: a selector only matches Pods in the Service's own namespace"
+      - "A validation error at apply time"
+      - "The Pod IPs, but DNS fails"
+    answer: 1
+    explain: "The EndpointSlice controller only lists Pods in the Service's namespace; cross-namespace selection is impossible."
+  - q: "You omit targetPort. The Service port is 80 and the container listens on 8080. Result?"
+    options:
+      - "kube-proxy discovers 8080 from the containerPort"
+      - "The API server rejects the Service"
+      - "targetPort defaults to 80 and clients get connection refused"
+      - "Traffic is forwarded to both ports"
+    answer: 2
+    explain: "targetPort defaults to the value of port. Nothing listens on 8080 inside the Pod, so the DNAT'ed connection is refused."
+  - q: "Which object does kube-proxy watch to decide where ClusterIP traffic goes?"
+    options:
+      - "The Service's spec.selector, evaluated against Pods on each node"
+      - "The EndpointSlice objects derived from the Service"
+      - "The Deployment's ReplicaSets"
+      - "CoreDNS records"
+    answer: 1
+    explain: "kube-proxy never evaluates selectors; it programs rules from the EndpointSlices the controller publishes. Empty slice, no rules."

@@ -1,0 +1,52 @@
+id: controller-manager-down
+title: "Deployment created, but nothing happens"
+realm: scenarios
+category: cluster
+type: troubleshoot
+difficulty: advanced
+estimated_minutes: 20
+tags: [control-plane, controller-manager, static-pods, kubeadm]
+requires_addons: []
+summary: "A Deployment stays at 0/3 with no ReplicaSet, no Pods and no events, while the API answers normally. Find out which control-plane process stopped reconciling."
+brief: |
+  **Ticket #5107 — P1 — Deployment created but no Pods appear**
+
+  A developer applied the `api` Deployment in `lab-cm` fifteen minutes ago.
+  `kubectl get deploy` shows `0/3` and never changes. There is no ReplicaSet,
+  no Pod and no event in the namespace. `kubectl apply` and `kubectl get` work
+  normally, so the API itself seems fine.
+
+  In parallel, two other teams noticed that a namespace they deleted stays
+  `Terminating` and that a namespace created this morning still has no
+  `default` ServiceAccount, so Pods there are rejected at admission. Nodes are
+  Ready, the scheduler is healthy, and existing apps keep serving. The
+  platform team mentions a "manifest cleanup" on the control-plane node this
+  morning.
+
+  **Lab note:** nodes are Docker containers here. Where you would `ssh` to the
+  control-plane node, run `docker exec -it sre-labs-control-plane bash`.
+
+  ## Your task
+  - `api` in `lab-cm` must reach 3/3 Ready through a ReplicaSet created by the
+    Deployment controller (no hand-made ReplicaSets or Pods).
+  - The `kube-controller-manager` Pod must be back and Ready in `kube-system`.
+namespace: lab-cm
+hints:
+  - "A Deployment with no ReplicaSet (kubectl get rs -n lab-cm) means the Deployment controller never ran. All built-in controllers live in one process: kubectl get pods -n kube-system -l component=kube-controller-manager ; kubectl get lease -n kube-system kube-controller-manager -o yaml"
+  - "kubeadm runs it as a static Pod from /etc/kubernetes/manifests/kube-controller-manager.yaml on the control-plane node; the kubelet there is the only thing that can start it. docker exec -it sre-labs-control-plane ls -la /etc/kubernetes/manifests"
+  - "Look for the file next door: ls -la /etc/kubernetes/*.bak. Move it back into the manifests directory; the kubelet creates the Pod within ~20 s. (Last resort: kubeadm init phase control-plane controller-manager --config /kind/kubeadm.conf)"
+  - "Confirm the comeback with kubectl get lease -n kube-system kube-controller-manager (renewTime advancing), then watch kubectl get rs,pods -n lab-cm fill up by itself."
+checks:
+  - name: "kube-controller-manager static Pod is Ready in kube-system"
+    cmd: kubectl get pod -n kube-system kube-controller-manager-sre-labs-control-plane -o jsonpath='{.status.containerStatuses[0].ready}' | grep -qx true
+  - name: "Controller-manager manifest is back in /etc/kubernetes/manifests on the control-plane node"
+    cmd: docker exec sre-labs-control-plane test -f /etc/kubernetes/manifests/kube-controller-manager.yaml
+  - name: "A ReplicaSet owned by the api Deployment exists (created by the controller, not by hand)"
+    cmd: kubectl get rs -n lab-cm -l app=api -o jsonpath='{.items[*].metadata.ownerReferences[*].kind}' | grep -q Deployment
+  - name: "api Deployment is 3/3 Ready"
+    cmd: test "$(kubectl get deploy -n lab-cm api -o jsonpath='{.status.readyReplicas}')" = "3"
+concepts:
+  - "kube-controller-manager hosts the reconciliation loops: Deployment -> ReplicaSet -> Pod, namespace deletion, the `default` ServiceAccount of each namespace, EndpointSlices, node lifecycle, garbage collection. When it is down the API still accepts writes but nothing *reacts* to them (see components/controller-manager)."
+  - "Signature of a dead controller-manager: objects can be created and read, but their dependants never appear and their status never updates; there are no errors anywhere because nothing is running to produce them."
+  - "Static Pod lifecycle: the control-plane kubelet mirrors /etc/kubernetes/manifests; removing a file removes the Pod with no API call involved. Check the Leases in kube-system to see which control-plane components are alive."
+related_lessons: [troubleshooting/cluster-triage]
